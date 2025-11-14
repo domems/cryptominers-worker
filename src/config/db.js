@@ -1,19 +1,15 @@
 // src/config/db.js
 import "dotenv/config";
-import dns from "dns";
-import fetchOrig from "node-fetch";
-import { neon, neonConfig } from "@neondatabase/serverless";
+import postgres from "postgres";
 
-// 1) Forçar IPv4 primeiro (IPv6 em Contabo é uma lotaria)
-dns.setDefaultResultOrder?.("ipv4first");
-
-// 2) Garantir que existe fetch global (Neon usa fetch por baixo)
-if (!globalThis.fetch) {
-  globalThis.fetch = fetchOrig;
-}
-
-// 3) Reutilizar conexões HTTP do Neon para não abrir mil sockets
-neonConfig.fetchConnectionCache = true;
+/**
+ * IMPORTANTE:
+ * Neste worker estamos num VPS sempre ligado (Contabo),
+ * por isso em vez do client HTTP do Neon usamos driver TCP normal.
+ *
+ * DATABASE_URL neste projeto deve ser algo como:
+ *   postgres://user:pass@ep-young-pond-adyd4alk-pooler.c-2.us-east-1.aws.neon.tech/neondb
+ */
 
 const rawUrl = process.env.DATABASE_URL;
 
@@ -22,18 +18,23 @@ if (!rawUrl) {
   throw new Error("DATABASE_URL missing");
 }
 
-// Log discreto só para confirmar host
 let host = "unknown";
 try {
-  // trocamos o esquema para http só para o URL parser não chorar
+  // truque só para extrair o host sem chorar com o esquema postgres
   const u = new URL(rawUrl.replace(/^postgres(ql)?:\/\//, "http://"));
   host = u.hostname;
 } catch {
   // ignore
 }
 
-console.log("[db] Using Neon DATABASE_URL host:", host);
+console.log("[db] Using PostgreSQL host:", host);
 
-// Cria conexão SQL
-export const sql = neon(rawUrl);
+// Cria cliente SQL com SSL obrigatório (Neon exige TLS)
+export const sql = postgres(rawUrl, {
+  ssl: "require",
+  max: 10,              // nº máx de conexões
+  idle_timeout: 20,     // segundos antes de fechar idle
+  connect_timeout: 10,  // segundos para timeout de connect
+});
+
 export default sql;
