@@ -17,7 +17,7 @@ if (!rawUrl) {
   console.error("[db] ❌ DATABASE_URL não definido no .env");
   throw new Error("DATABASE_URL missing");
 }
- 
+
 let host = "unknown";
 try {
   // truque só para extrair o host sem chorar com o esquema postgres
