@@ -1,0 +1,21 @@
+{
+  "name": "cryptominers-worker",
+  "version": "1.0.0",
+  "description": "Background worker & cron jobs (pools uptime) for CryptoMiners",
+  "main": "src/worker.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/worker.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@neondatabase/serverless": "^0.9.0",
+    "@upstash/redis": "^1.28.3",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "node-cron": "^3.0.3",
+    "node-fetch": "^3.3.2"
+  }
+}
