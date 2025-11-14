@@ -1,0 +1,36 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main    # muda para master se o teu branch principal for master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            cd ${{ secrets.VPS_PROJECT_PATH }}
+            echo "[deploy] Pulling latest code..."
+            git pull origin main
+
+            echo "[deploy] Installing dependencies..."
+            npm install --production
+
+            echo "[deploy] Restarting PM2 app..."
+            pm2 restart cryptominers-worker || pm2 start "npm start" --name cryptominers-worker
+
+            pm2 save
+
+            echo "[deploy] Done."
