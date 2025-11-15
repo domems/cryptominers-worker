@@ -4,11 +4,10 @@ import postgres from "postgres";
 
 /**
  * Conexão PostgreSQL (Neon) para o worker no VPS.
- *
- * - Usa driver TCP normal (postgres) em vez do client HTTP da Neon.
- * - SSL obrigatório (Neon exige TLS).
- * - Pool pequeno e estável (max 10 ligações).
- * - Timeouts explícitos + retries em CONNECT_TIMEOUT.
+ * - TLS obrigatório
+ * - Pool com limites
+ * - Retries em CONNECT_TIMEOUT
+ * - Loga SQL em caso de erro de sintaxe (42601) com placeholders
  */
 
 const rawUrl = process.env.DATABASE_URL;
@@ -30,10 +29,22 @@ const DB_CONNECT_TIMEOUT = Number.parseInt(
   process.env.DB_CONNECT_TIMEOUT || "10",
   10
 );
-const DB_RETRIES = Number.parseInt(process.env.DB_RETRIES || "2", 10); // nº de retries extra em CONNECT_TIMEOUT
+const DB_RETRIES = Number.parseInt(process.env.DB_RETRIES || "2", 10);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// constrói texto da query com placeholders $1, $2... (sem valores reais)
+function buildQueryText(strings, values) {
+  let text = "";
+  for (let i = 0; i < strings.length; i++) {
+    text += strings[i];
+    if (i < values.length) {
+      text += `$${i + 1}`;
+    }
+  }
+  return text.trim();
 }
 
 let baseSql;
@@ -71,15 +82,9 @@ try {
   throw e;
 }
 
-/**
- * Wrapper em volta do tagged template do postgres.
- * - Re-tenta queries em caso de CONNECT_TIMEOUT.
- * - Mantém métodos auxiliares (`sql.begin`, `sql.end`, etc.).
- */
 async function sqlWrapper(strings, ...values) {
+  const text = buildQueryText(strings, values);
   let attempt = 0;
-
-  // tentativas = 1 (original) + DB_RETRIES
   const maxAttempts = 1 + DB_RETRIES;
 
   while (true) {
@@ -97,14 +102,21 @@ async function sqlWrapper(strings, ...values) {
         console.warn("[db] CONNECT_TIMEOUT, retrying query", {
           attempt,
           maxAttempts,
-          code: e.code,
         });
-        // pequeno backoff
         await sleep(200 * attempt);
         continue;
       }
 
-      // outros erros, ou esgotámos retries → manda para cima
+      // log detalhado para syntax error
+      if (e && e.code === "42601") {
+        console.error("[db] SQL syntax error", {
+          code: e.code,
+          message: e.message,
+          position: e.position,
+          query: text,
+        });
+      }
+
       throw e;
     }
   }
