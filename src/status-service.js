@@ -179,7 +179,7 @@ function parseMDWorkersPayload(data) {
 
 /* ========= HTTP util ========= */
 
-const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = 20_000;
 const SLOW_LOG_MS = 5_000;
 
 async function fetchJSON(url, opts = {}, retries = 1) {
@@ -269,7 +269,7 @@ async function pickBinanceBase() {
   for (const base of BINANCE_BASES) {
     const ping = await fetchJSON(
       `${base}/api/v3/exchangeInfo`,
-      { timeout: 7_000 },
+      { timeout: 20_000 },
       1
     );
     if (ping.res?.ok) return base;
@@ -279,7 +279,7 @@ async function pickBinanceBase() {
 }
 
 async function getServerTime(base) {
-  const r = await fetchJSON(`${base}/api/v3/time`, { timeout: 7_000 }, 1);
+  const r = await fetchJSON(`${base}/api/v3/time`, { timeout: 20_000 }, 1);
   if (!r.res?.ok) return null;
   const t = Number(r?.json?.serverTime);
   return Number.isFinite(t) ? t : null;
@@ -289,7 +289,7 @@ async function signedGET({ base, path, apiKey, secretKey, params, skewMs = 0 }) 
   const headers = { "X-MBX-APIKEY": apiKey };
   const p = { ...params, timestamp: Date.now() + skewMs, recvWindow: 30_000 };
   const url = `${base}${path}?` + signQuery(secretKey, p);
-  return fetchJSON(url, { headers, timeout: 10_000 }, 1);
+  return fetchJSON(url, { headers, timeout: 20_000 }, 1);
 }
 
 /* ========= CORE: fetch status de UM miner, com rec já carregado opcional ========= */
@@ -637,7 +637,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
     for (const url of urls) {
       const { res: r, json } = await fetchJSON(
         url,
-        { timeout: 12_000 },
+        { timeout: 22_000 },
         1
       );
       if (!r || !r.ok) continue;

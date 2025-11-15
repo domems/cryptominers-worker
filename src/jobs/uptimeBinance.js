@@ -89,7 +89,7 @@ async function fetchWithRetry(url, opts = {}, retries = 2) {
       const controller = new AbortController();
       const to = setTimeout(
         () => controller.abort(),
-        opts.timeout ?? 10_000
+        opts.timeout ?? 20_000
       );
       resp = await fetch(url, { ...opts, signal: controller.signal });
       clearTimeout(to);
@@ -156,7 +156,7 @@ async function binanceListWorkers({
       pageIndex: page,
       sort: 0,
       timestamp: Date.now(),
-      recvWindow: 10_000,
+      recvWindow: 20_000,
     };
     const url = `${base}/sapi/v1/mining/worker/list?${signQuery(
       secretKey,

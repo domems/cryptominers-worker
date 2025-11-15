@@ -75,7 +75,7 @@ function isOnlineFrom(w) {
 /* API fetch + caches              */
 /* =============================== */
 const API_TTL_MS = 60_000; // cache em memória por grupo (api_key|coin)
-const API_TIMEOUT_MS = 12_000;
+const API_TIMEOUT_MS = 20_000;
 
 const apiCache = new Map(); // key -> { workers, ts }
 let lastSlot = null;
