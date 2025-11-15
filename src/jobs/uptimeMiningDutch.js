@@ -8,15 +8,32 @@ import { redis } from "../config/upstash.js";
 function slotISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
-  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), q, 0));
+  const t = new Date(
+    Date.UTC(
+      d.getUTCFullYear(),
+      d.getUTCMonth(),
+      d.getUTCDate(),
+      d.getUTCHours(),
+      q,
+      0
+    )
+  );
   return t.toISOString();
 }
 
 /* ===== helpers ===== */
 const norm = (s) => String(s ?? "").trim();
-const low  = (s) => norm(s).toLowerCase();
-const tail = (s) => { const str = norm(s); const i = str.lastIndexOf("."); return i >= 0 ? str.slice(i + 1) : str; };
-const head = (s) => { const str = norm(s); const i = str.indexOf("."); return i >= 0 ? str.slice(0, i) : str; };
+const low = (s) => norm(s).toLowerCase();
+const tail = (s) => {
+  const str = norm(s);
+  const i = str.lastIndexOf(".");
+  return i >= 0 ? str.slice(i + 1) : str;
+};
+const head = (s) => {
+  const str = norm(s);
+  const i = str.indexOf(".");
+  return i >= 0 ? str.slice(0, i) : str;
+};
 
 function algoFromCoin(coin) {
   const c = String(coin || "").trim().toUpperCase();
@@ -36,10 +53,12 @@ function buildCandidateUrls({ coin, account_id, api_key }) {
   const algo = algoFromCoin(coin);
   const coinSlug = mapCoinSlug(coin);
   const mk = (name) =>
-    `${base}/pools/${name}.php?page=api&action=getuserworkers&id=${encodeURIComponent(account_id)}&api_key=${encodeURIComponent(api_key)}`;
+    `${base}/pools/${name}.php?page=api&action=getuserworkers&id=${encodeURIComponent(
+      account_id
+    )}&api_key=${encodeURIComponent(api_key)}`;
 
   const urls = [];
-  if (algo) urls.push(mk(algo));         // sha256.php / scrypt.php
+  if (algo) urls.push(mk(algo)); // sha256.php / scrypt.php
   if (coinSlug) urls.push(mk(coinSlug)); // bitcoin.php / litecoin.php / dogecoin.php
   if (algo === "sha256") urls.push(mk("scrypt"));
   if (algo === "scrypt") urls.push(mk("sha256"));
@@ -54,7 +73,11 @@ function isOnlineFromWorker(w) {
   const hr = Number(w?.hashrate ?? w?.hash ?? 0);
   if (!Number.isNaN(hr) && hr > 0) return true;
   const st = low(w?.status);
-  if (st && ["alive","online","active","up","working","connected"].includes(st)) return true;
+  if (
+    st &&
+    ["alive", "online", "active", "up", "working", "connected"].includes(st)
+  )
+    return true;
   return false;
 }
 
@@ -64,7 +87,10 @@ function parseWorkersPayload(data) {
 
   // 1) formato com chave topo "getuserworkers"
   if (data.getuserworkers && data.getuserworkers.data) {
-    const miners = data.getuserworkers.data.miners || data.getuserworkers.data.workers || [];
+    const miners =
+      data.getuserworkers.data.miners ||
+      data.getuserworkers.data.workers ||
+      [];
     if (Array.isArray(miners)) {
       return miners.map((v, i) => ({
         name: norm(v?.worker ?? v?.name ?? v?.username ?? String(i)),
@@ -128,7 +154,11 @@ async function fetchMiningDutchWorkers({ coin, account_id, api_key }) {
       const data = await res.json().catch(() => null);
       const list = parseWorkersPayload(data);
       if (!list) {
-        console.warn("[miningdutch] schema inesperado", url, JSON.stringify(data)?.slice(0, 300));
+        console.warn(
+          "[miningdutch] schema inesperado",
+          url,
+          JSON.stringify(data)?.slice(0, 300)
+        );
         continue;
       }
       // normalização final (usar username como nome se existir)
@@ -151,18 +181,21 @@ async function fetchMiningDutchWorkers({ coin, account_id, api_key }) {
 let lastSlot = null;
 const updatedInSlot = new Set();
 function beginSlot(s) {
-  if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); }
+  if (s !== lastSlot) {
+    lastSlot = s;
+    updatedInSlot.clear();
+  }
 }
 function dedupeForHours(ids) {
   const out = [];
   for (const id of ids) {
-    if (!updatedInSlot.has(id)) { updatedInSlot.add(id); out.push(id); }
+    if (!updatedInSlot.has(id)) {
+      updatedInSlot.add(id);
+      out.push(id);
+    }
   }
   return out;
 }
-
-/* ===== bloquear writes quando status já é 'maintenance' ===== */
-const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
 
 /* ===== job principal ===== */
 export async function runUptimeMiningDutchOnce() {
@@ -188,14 +221,21 @@ export async function runUptimeMiningDutchOnce() {
         AND api_key IS NOT NULL AND api_key <> ''
         AND worker_name IS NOT NULL AND worker_name <> ''
     `;
-    if (!miners.length) return { ok: true, updated: 0, statusChanged: 0 };
+    if (!miners.length)
+      return { ok: true, updated: 0, statusChanged: 0 };
 
     // group by api_key + account_id (head(worker_name)) + coin
     const groups = new Map();
     for (const m of miners) {
       const account_id = head(m.worker_name);
       const key = `${m.api_key}::${account_id}::${m.coin || ""}`;
-      if (!groups.has(key)) groups.set(key, { account_id, api_key: m.api_key, coin: m.coin, list: [] });
+      if (!groups.has(key))
+        groups.set(key, {
+          account_id,
+          api_key: m.api_key,
+          coin: m.coin,
+          list: [],
+        });
       groups.get(key).list.push(m);
     }
 
@@ -205,11 +245,16 @@ export async function runUptimeMiningDutchOnce() {
       const offlineIdsRaw = [];
 
       try {
-        const workers = await fetchMiningDutchWorkers({ coin, account_id, api_key });
+        const workers = await fetchMiningDutchWorkers({
+          coin,
+          account_id,
+          api_key,
+        });
 
         // index por tail (lowercase)
         const byTail = new Map();
-        for (const w of workers) byTail.set(low(tail(w.name) || w.name), w);
+        for (const w of workers)
+          byTail.set(low(tail(w.name) || w.name), w);
 
         for (const m of list) {
           const t = low(tail(m.worker_name));
@@ -230,7 +275,7 @@ export async function runUptimeMiningDutchOnce() {
           UPDATE miners
           SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
           WHERE id = ANY(${onlineIdsForHours})
-            ${IS_NOT_MAINT}
+            AND lower(COALESCE(status, '')) <> 'maintenance'
         `;
         hoursUpdated += onlineIdsForHours.length;
       }
@@ -242,10 +287,12 @@ export async function runUptimeMiningDutchOnce() {
           SET status = 'online'
           WHERE id = ANY(${onlineIdsRaw})
             AND status IS DISTINCT FROM 'online'
-            ${IS_NOT_MAINT}
+            AND lower(COALESCE(status, '')) <> 'maintenance'
           RETURNING id
         `;
-        statusToOnline += Array.isArray(r1) ? r1.length : (r1?.count || 0);
+        statusToOnline += Array.isArray(r1)
+          ? r1.length
+          : r1?.count || 0;
       }
       if (offlineIdsRaw.length) {
         const r2 = await sql/*sql*/`
@@ -253,17 +300,27 @@ export async function runUptimeMiningDutchOnce() {
           SET status = 'offline'
           WHERE id = ANY(${offlineIdsRaw})
             AND status IS DISTINCT FROM 'offline'
-            ${IS_NOT_MAINT}
+            AND lower(COALESCE(status, '')) <> 'maintenance'
           RETURNING id
         `;
-        statusToOffline += Array.isArray(r2) ? r2.length : (r2?.count || 0);
+        statusToOffline += Array.isArray(r2)
+          ? r2.length
+          : r2?.count || 0;
       }
 
-      console.log(`[uptime:miningdutch] acct=${account_id} coin=${coin || "-"} workers=${list.length} onlineAPI=${onlineIdsRaw.length} offlineAPI=${offlineIdsRaw.length}`);
+      console.log(
+        `[uptime:miningdutch] acct=${account_id} coin=${
+          coin || "-"
+        } workers=${list.length} onlineAPI=${onlineIdsRaw.length} offlineAPI=${
+          offlineIdsRaw.length
+        }`
+      );
     }
 
     const statusChanged = statusToOnline + statusToOffline;
-    console.log(`[uptime:miningdutch] ${sISO} – horas+: ${hoursUpdated}, ->online: ${statusToOnline}, ->offline: ${statusToOffline}`);
+    console.log(
+      `[uptime:miningdutch] ${sISO} – horas+: ${hoursUpdated}, ->online: ${statusToOnline}, ->offline: ${statusToOffline}`
+    );
     return { ok: true, updated: hoursUpdated, statusChanged };
   } catch (e) {
     console.error("⛔ uptime:miningdutch", e);
@@ -275,7 +332,11 @@ export function startUptimeMiningDutch() {
   cron.schedule(
     "*/15 * * * *",
     async () => {
-      try { await runUptimeMiningDutchOnce(); } catch (e) { console.error("⛔ miningdutch cron:", e); }
+      try {
+        await runUptimeMiningDutchOnce();
+      } catch (e) {
+        console.error("⛔ miningdutch cron:", e);
+      }
     },
     { timezone: "Europe/Lisbon" }
   );

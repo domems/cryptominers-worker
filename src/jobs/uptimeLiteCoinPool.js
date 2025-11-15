@@ -1,3 +1,4 @@
+// src/jobs/uptimeLiteCoinPool.js
 import cron from "node-cron";
 import fetch from "node-fetch";
 import { sql } from "../config/db.js";
@@ -6,7 +7,16 @@ import { redis } from "../config/upstash.js";
 function slotISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
-  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), q, 0));
+  const t = new Date(
+    Date.UTC(
+      d.getUTCFullYear(),
+      d.getUTCMonth(),
+      d.getUTCDate(),
+      d.getUTCHours(),
+      q,
+      0
+    )
+  );
   return t.toISOString();
 }
 
@@ -20,19 +30,24 @@ async function fetchLitecoinPoolWorkers(apiKey) {
 // Controle de slot para evitar atualizar horas mais que 1x/slot
 let lastSlot = null;
 const updatedInSlot = new Set();
+
 function beginSlot(s) {
-  if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); }
+  if (s !== lastSlot) {
+    lastSlot = s;
+    updatedInSlot.clear();
+  }
 }
+
 function dedupeForHours(ids) {
   const out = [];
   for (const id of ids) {
-    if (!updatedInSlot.has(id)) { updatedInSlot.add(id); out.push(id); }
+    if (!updatedInSlot.has(id)) {
+      updatedInSlot.add(id);
+      out.push(id);
+    }
   }
   return out;
 }
-
-/* ===== Bloqueio manutenção (status DB) ===== */
-const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
 
 export async function runUptimeLTCPoolOnce() {
   const sISO = slotISO();
@@ -42,7 +57,9 @@ export async function runUptimeLTCPoolOnce() {
   const lockKey = `uptime:${sISO}:ltcpool`;
   const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
   if (!gotLock) {
-    console.log(`[uptime:ltcpool] lock ativo (${sISO}) – ignorado nesta instância.`);
+    console.log(
+      `[uptime:ltcpool] lock ativo (${sISO}) – ignorado nesta instância.`
+    );
     return { ok: true, skipped: true };
   }
 
@@ -56,8 +73,8 @@ export async function runUptimeLTCPoolOnce() {
       SELECT id, worker_name, api_key
       FROM miners
       WHERE pool = 'LiteCoinPool'
-        AND api_key IS NOT NULL
-        AND worker_name IS NOT NULL
+        AND api_key IS NOT NULL AND api_key <> ''
+        AND worker_name IS NOT NULL AND worker_name <> ''
     `;
     if (!miners.length) return { ok: true, updated: 0, statusChanged: 0 };
 
@@ -93,7 +110,7 @@ export async function runUptimeLTCPoolOnce() {
           UPDATE miners
           SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
           WHERE id = ANY(${onlineIdsForHours})
-            ${IS_NOT_MAINT}
+            AND lower(COALESCE(status, '')) <> 'maintenance'
         `;
         hoursUpdated += onlineIdsForHours.length;
       }
@@ -105,28 +122,41 @@ export async function runUptimeLTCPoolOnce() {
           SET status = 'online'
           WHERE id = ANY(${onlineIdsRaw})
             AND status IS DISTINCT FROM 'online'
-            ${IS_NOT_MAINT}
+            AND lower(COALESCE(status, '')) <> 'maintenance'
           RETURNING id
         `;
-        statusToOnline += (Array.isArray(r1) ? r1.length : (r1?.count || 0));
+        statusToOnline += Array.isArray(r1)
+          ? r1.length
+          : r1?.count || 0;
       }
+
       if (offlineIdsRaw.length) {
         const r2 = await sql/*sql*/`
           UPDATE miners
           SET status = 'offline'
           WHERE id = ANY(${offlineIdsRaw})
             AND status IS DISTINCT FROM 'offline'
-            ${IS_NOT_MAINT}
+            AND lower(COALESCE(status, '')) <> 'maintenance'
           RETURNING id
         `;
-        statusToOffline += (Array.isArray(r2) ? r2.length : (r2?.count || 0));
+        statusToOffline += Array.isArray(r2)
+          ? r2.length
+          : r2?.count || 0;
       }
 
-      console.log(`[uptime:ltcpool] grupo apiKey=*** – workers: ${list.length}, onlineAPI: ${onlineIdsRaw.length}, offlineAPI: ${offlineIdsRaw.length}`);
+      console.log(
+        `[uptime:ltcpool] grupo apiKey=*** – workers: ${
+          list.length
+        }, onlineAPI: ${onlineIdsRaw.length}, offlineAPI: ${
+          offlineIdsRaw.length
+        }`
+      );
     }
 
     const statusChanged = statusToOnline + statusToOffline;
-    console.log(`[uptime:ltcpool] ${sISO} – horas+: ${hoursUpdated}, status->online: ${statusToOnline}, status->offline: ${statusToOffline}`);
+    console.log(
+      `[uptime:ltcpool] ${sISO} – horas+: ${hoursUpdated}, status->online: ${statusToOnline}, status->offline: ${statusToOffline}`
+    );
     return { ok: true, updated: hoursUpdated, statusChanged };
   } catch (e) {
     console.error("⛔ uptime:ltcpool", e);
@@ -138,7 +168,11 @@ export function startUptimeLTCPool() {
   cron.schedule(
     "*/15 * * * *",
     async () => {
-      try { await runUptimeLTCPoolOnce(); } catch (e) { console.error("⛔ ltcpool cron:", e); }
+      try {
+        await runUptimeLTCPoolOnce();
+      } catch (e) {
+        console.error("⛔ ltcpool cron:", e);
+      }
     },
     { timezone: "Europe/Lisbon" }
   );

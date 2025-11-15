@@ -9,7 +9,8 @@ import { sql } from "../config/db.js";
 const fetch = globalThis.fetch || fetchOrig;
 
 const TAG = "[uptime:viabtc]";
-const DEBUG = "true";
+const DEBUG =
+  String(process.env.DEBUG_UPTIME_VIABTC ?? "true").toLowerCase() === "true";
 
 const dlog = (...args) => {
   if (DEBUG) {
@@ -261,9 +262,6 @@ async function getViaBTCWorkersCached(apiKey, coin, slot) {
   return { workers, cache: "miss" };
 }
 
-/* ===== Bloqueio manutenção (status DB) ===== */
-const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
-
 /* =============================== */
 /* Job principal                   */
 /* =============================== */
@@ -289,7 +287,7 @@ export async function runUptimeViaBTCOnce() {
 
   try {
     const minersRaw = await sql/*sql*/`
-      SELECT id, worker_name, api_key, coin
+      SELECT id, worker_name, api_key, coin, status
       FROM miners
       WHERE pool = 'ViaBTC'
         AND api_key IS NOT NULL AND api_key <> ''
@@ -507,7 +505,7 @@ export async function runUptimeViaBTCOnce() {
             UPDATE miners
             SET total_horas_online = COALESCE(total_horas_online,0) + 0.25
             WHERE id = ANY(${ids})
-              ${IS_NOT_MAINT}
+              AND lower(COALESCE(status, '')) <> 'maintenance'
             RETURNING id
           `;
           const inc = Array.isArray(r) ? r.length : r?.count || 0;
@@ -522,7 +520,7 @@ export async function runUptimeViaBTCOnce() {
             SET status = 'online'
             WHERE id = ANY(${onlineIdsRaw})
               AND status IS DISTINCT FROM 'online'
-              ${IS_NOT_MAINT}
+              AND lower(COALESCE(status, '')) <> 'maintenance'
             RETURNING id
           `;
           const c1 = Array.isArray(r1) ? r1.length : r1?.count || 0;
@@ -539,7 +537,7 @@ export async function runUptimeViaBTCOnce() {
             SET status = 'offline'
             WHERE id = ANY(${offlineIdsRaw})
               AND status IS DISTINCT FROM 'offline'
-              ${IS_NOT_MAINT}
+              AND lower(COALESCE(status, '')) <> 'maintenance'
             RETURNING id
           `;
           const c2 = Array.isArray(r2) ? r2.length : r2?.count || 0;
