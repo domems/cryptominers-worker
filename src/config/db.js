@@ -18,16 +18,9 @@ if (!rawUrl) {
   throw new Error("DATABASE_URL missing");
 }
 
-let host = "unknown";
-try {
-  // truque só para extrair o host sem chorar com o esquema postgres
-  const u = new URL(rawUrl.replace(/^postgres(ql)?:\/\//, "http://"));
-  host = u.hostname;
-} catch {
-  // ignore
-}
 
-console.log("[db] Using PostgreSQL host:", host);
+
+console.log("[db] Using PostgreSQL");
 
 // Cria cliente SQL com SSL obrigatório (Neon exige TLS)
 export const sql = postgres(rawUrl, {

@@ -145,24 +145,50 @@ function parseMDWorkersPayload(data) {
 /* ========= HTTP util ========= */
 async function fetchJSON(url, opts = {}, retries = 1) {
   let attempt = 0;
+  const timeoutMs = opts.timeout ?? 10_000;
+
   while (true) {
     attempt++;
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
-      const controller = new AbortController();
-      const to = setTimeout(() => controller.abort(), opts.timeout ?? 10_000);
       const res = await fetch(url, { ...opts, signal: controller.signal });
       clearTimeout(to);
+
       let text = "";
       try {
         text = await res.text();
       } catch {}
+
       let json = null;
       try {
         json = text ? JSON.parse(text) : null;
       } catch {}
+
       return { res, json, raw: text };
     } catch (e) {
-      if (attempt > retries) throw e;
+      clearTimeout(to);
+      const isAbort = e && e.name === "AbortError";
+
+      if (isAbort) {
+        // timeout – tratamos como falha "limpa" sem rebentar o worker
+        if (attempt > retries) {
+          console.warn("[fetchJSON] timeout", { url, timeoutMs });
+          return { res: null, json: null, raw: null };
+        }
+      } else {
+        // erro de rede / DNS / etc
+        if (attempt > retries) {
+          console.error("[fetchJSON] fetch failed", {
+            url,
+            message: e?.message || String(e),
+          });
+          return { res: null, json: null, raw: null };
+        }
+      }
+
+      // backoff entre tentativas
       await new Promise((r) =>
         setTimeout(r, 300 * attempt + Math.random() * 300)
       );
@@ -255,7 +281,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       { headers: { "X-API-KEY": api_key } },
       1
     );
-    if (!r.ok || !data || data.code !== 0)
+    if (!r || !r.ok || !data || data.code !== 0)
       return { id: String(minerId), error: "viabtc_error" };
     const list = Array.isArray(data?.data?.data) ? data.data.data : [];
     workers = list.map((w) => ({
@@ -269,7 +295,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       api_key
     )}`;
     const { res: r, json: data } = await fetchJSON(url, {}, 1);
-    if (!r.ok || !data || !data.workers)
+    if (!r || !r.ok || !data || !data.workers)
       return { id: String(minerId), error: "ltcp_error" };
     workers = Object.entries(data.workers).map(([name, info]) => ({
       worker_name: String(name ?? "").trim(),
@@ -293,7 +319,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       secretKey: secret_key,
       params: { algo, userName: account, pageIndex: 1, pageSize: 200, sort: 0 },
     });
-    if (!L.res.ok && L.json?.code === -1021) {
+    if (L.res && !L.res.ok && L.json?.code === -1021) {
       const serverTime = await getServerTime(base);
       if (serverTime) {
         const skewMs = serverTime - Date.now();
@@ -307,7 +333,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
         });
       }
     }
-    if (!L.res.ok) return { id: String(minerId), error: "binance_error" };
+    if (!L.res || !L.res.ok) return { id: String(minerId), error: "binance_error" };
     const listArr = Array.isArray(L.json?.data?.workerDatas)
       ? L.json.data.workerDatas
       : [];
@@ -331,7 +357,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
         secretKey: secret_key,
         params: { algo, userName: account, workerName: expectedTail },
       });
-      if (!D.res.ok && D.json?.code === -1021) {
+      if (D.res && !D.res.ok && D.json?.code === -1021) {
         const serverTime = await getServerTime(base);
         if (serverTime) {
           const skewMs = serverTime - Date.now();
@@ -345,7 +371,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
           });
         }
       }
-      if (D.res.ok && D.json?.data) {
+      if (D.res && D.res.ok && D.json?.data) {
         const d = D.json.data;
         workers.push({
           worker_name: String(d?.workerName ?? expectedTail),
@@ -376,7 +402,11 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       { method: "POST", headers, body, timeout: 15000 },
       1
     );
-    if (!r.ok || (data && typeof data.code === "number" && data.code !== 0)) {
+    if (
+      !r ||
+      !r.ok ||
+      (data && typeof data.code === "number" && data.code !== 0)
+    ) {
       return { id: String(minerId), error: "f2_error" };
     }
     const arr = Array.isArray(data?.workers)
@@ -429,7 +459,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
     let parsed = null;
     for (const url of urls) {
       const { res: r, json } = await fetchJSON(url, { timeout: 12000 }, 1);
-      if (!r.ok) continue;
+      if (!r || !r.ok) continue;
       const list = parseMDWorkersPayload(json);
       if (Array.isArray(list)) {
         parsed = list;
