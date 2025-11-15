@@ -1,7 +1,14 @@
 // src/status-service.js
 import crypto from "crypto";
 import fetch from "node-fetch";
+import dns from "dns";
 import { sql } from "./config/db.js";
+
+/* ========= DNS / IPv4-first (melhor para muitas VPS) ========= */
+if (typeof dns.setDefaultResultOrder === "function") {
+  // força IPv4 primeiro, evita ficar pendurado em IPv6 marado
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 /* ========= logger ========= */
 const TAG = "[status-service]";
@@ -171,18 +178,26 @@ function parseMDWorkersPayload(data) {
 }
 
 /* ========= HTTP util ========= */
+
+const DEFAULT_TIMEOUT_MS = 10_000;
+const SLOW_LOG_MS = 5_000;
+
 async function fetchJSON(url, opts = {}, retries = 1) {
   let attempt = 0;
-  const timeoutMs = opts.timeout ?? 10_000;
+  const timeoutMs =
+    typeof opts.timeout === "number" ? opts.timeout : DEFAULT_TIMEOUT_MS;
 
   while (true) {
     attempt++;
     const controller = new AbortController();
+    const start = Date.now();
     const to = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const res = await fetch(url, { ...opts, signal: controller.signal });
       clearTimeout(to);
+
+      const ms = Date.now() - start;
 
       let text = "";
       try {
@@ -198,20 +213,31 @@ async function fetchJSON(url, opts = {}, retries = 1) {
         // ignore
       }
 
+      if (ms > SLOW_LOG_MS) {
+        logWarn("[fetchJSON] slow", {
+          url,
+          status: res.status,
+          ms,
+          timeoutMs,
+        });
+      }
+
       return { res, json, raw: text };
     } catch (e) {
       clearTimeout(to);
+      const ms = Date.now() - start;
       const isAbort = e && e.name === "AbortError";
 
       if (isAbort) {
         if (attempt > retries) {
-          logWarn("[fetchJSON] timeout", { url, timeoutMs });
+          logWarn("[fetchJSON] timeout", { url, timeoutMs, ms, attempt });
           return { res: null, json: null, raw: null };
         }
       } else {
         if (attempt > retries) {
           logError("[fetchJSON] fetch failed", {
             url,
+            ms,
             message: e?.message || String(e),
           });
           return { res: null, json: null, raw: null };
@@ -243,7 +269,7 @@ async function pickBinanceBase() {
   for (const base of BINANCE_BASES) {
     const ping = await fetchJSON(
       `${base}/api/v3/exchangeInfo`,
-      { timeout: 7000 },
+      { timeout: 7_000 },
       1
     );
     if (ping.res?.ok) return base;
@@ -253,7 +279,7 @@ async function pickBinanceBase() {
 }
 
 async function getServerTime(base) {
-  const r = await fetchJSON(`${base}/api/v3/time`, { timeout: 7000 }, 1);
+  const r = await fetchJSON(`${base}/api/v3/time`, { timeout: 7_000 }, 1);
   if (!r.res?.ok) return null;
   const t = Number(r?.json?.serverTime);
   return Number.isFinite(t) ? t : null;
@@ -263,7 +289,7 @@ async function signedGET({ base, path, apiKey, secretKey, params, skewMs = 0 }) 
   const headers = { "X-MBX-APIKEY": apiKey };
   const p = { ...params, timestamp: Date.now() + skewMs, recvWindow: 30_000 };
   const url = `${base}${path}?` + signQuery(secretKey, p);
-  return fetchJSON(url, { headers }, 1);
+  return fetchJSON(url, { headers, timeout: 10_000 }, 1);
 }
 
 /* ========= CORE: fetch status de UM miner, com rec já carregado opcional ========= */
@@ -353,7 +379,10 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
     )}`;
     const { res: r, json: data } = await fetchJSON(
       url,
-      { headers: { "X-API-KEY": api_key } },
+      {
+        headers: { "X-API-KEY": api_key },
+        timeout: 20_000, // VPS pode ter rota lenta para China
+      },
       1
     );
     if (!r || !r.ok || !data || data.code !== 0) {
@@ -382,7 +411,11 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
     const url = `https://www.litecoinpool.org/api?api_key=${encodeURIComponent(
       api_key
     )}`;
-    const { res: r, json: data } = await fetchJSON(url, {}, 1);
+    const { res: r, json: data } = await fetchJSON(
+      url,
+      { timeout: 15_000 },
+      1
+    );
     if (!r || !r.ok || !data || !data.workers) {
       logWarn("[LiteCoinPool] bad response", {
         id: idStr,
@@ -528,11 +561,15 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
 
     const { res: r, json: data } = await fetchJSON(
       url,
-      { method: "POST", headers, body, timeout: 15000 },
+      { method: "POST", headers, body, timeout: 15_000 },
       1
     );
 
-    if (!r || !r.ok || (data && typeof data.code === "number" && data.code !== 0)) {
+    if (
+      !r ||
+      !r.ok ||
+      (data && typeof data.code === "number" && data.code !== 0)
+    ) {
       logWarn("[F2Pool] bad response", {
         id: idStr,
         status: r?.status,
@@ -598,7 +635,11 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
 
     let parsed = null;
     for (const url of urls) {
-      const { res: r, json } = await fetchJSON(url, { timeout: 12000 }, 1);
+      const { res: r, json } = await fetchJSON(
+        url,
+        { timeout: 12_000 },
+        1
+      );
       if (!r || !r.ok) continue;
       const list = parseMDWorkersPayload(json);
       if (Array.isArray(list)) {
@@ -674,7 +715,11 @@ export async function getMinerStatus(req, res) {
   }
 }
 
-/* ========= Batch endpoint (OTIMIZADO) ========= */
+/* ========= Batch endpoint (OTIMIZADO PARA VPS) ========= */
+
+const STATUS_CONCURRENCY =
+  Number(process.env.STATUS_CONCURRENCY || "3") || 3;
+
 export async function getMinersStatusMany(req, res) {
   const raw = String(req.query.ids ?? "").trim();
   if (!raw) return res.status(400).json({ error: "ids_vazios" });
@@ -761,8 +806,8 @@ export async function getMinersStatusMany(req, res) {
 
     const mapMiner = new Map(rows.map((r) => [String(r.id), r]));
 
-    // 3) concorrência limitada a 4 workers
-    const CONC = 4;
+    // 3) concorrência limitada (ajustável por env para VPS)
+    const CONC = STATUS_CONCURRENCY;
     const queue = [...toFetch];
     const outBatch = [];
 
