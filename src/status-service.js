@@ -9,23 +9,27 @@ const CACHE_TTL_MS = 30 * 1000;
 
 /* ========= helpers básicos ========= */
 const toLower = (s) => String(s ?? "").toLowerCase();
+
 function clean(s) {
   return String(s ?? "")
     .normalize("NFKC")
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .trim();
 }
+
 function tail(name) {
   const s = String(name ?? "").trim().toLowerCase();
   if (!s) return "";
   const i = s.lastIndexOf(".");
   return i >= 0 ? s.slice(i + 1) : s;
 }
+
 function tailKey(name) {
   const t = tail(name);
   const k = t.replace(/^0+/, "");
   return k === "" ? "0" : k;
 }
+
 function normalizeStatus(v) {
   const s = String(v ?? "").trim().toLowerCase();
   const NEG = new Set([
@@ -53,12 +57,14 @@ function normalizeStatus(v) {
   if (POS.has(s)) return "online";
   return "offline";
 }
+
 function splitAccountWorker(name) {
   const wn = clean(name);
   const i = wn.indexOf(".");
   if (i <= 0) return { account: "", worker: "" };
   return { account: wn.slice(0, i), worker: wn.slice(i + 1) };
 }
+
 function mapAlgo(coin) {
   const c = String(coin ?? "").trim().toUpperCase();
   if (c === "BTC") return "sha256";
@@ -66,6 +72,7 @@ function mapAlgo(coin) {
   if (c === "KAS" || c === "KASPA") return "kHeavyHash";
   return "";
 }
+
 function f2slug(coin) {
   const c = String(coin ?? "").trim().toUpperCase();
   if (c === "BTC" || c === "BITCOIN") return "bitcoin";
@@ -88,12 +95,14 @@ function mdSlug(coin) {
   if (c === "DOGE") return "dogecoin";
   return "";
 }
+
 function mdAlgo(coin) {
   const c = String(coin ?? "").trim().toUpperCase();
   if (c === "BTC") return "sha256";
   if (c === "LTC" || c === "DOGE") return "scrypt";
   return "";
 }
+
 function buildMDUrls({ coin, account_id, api_key }) {
   const base = "https://www.mining-dutch.nl";
   const algo = mdAlgo(coin);
@@ -114,9 +123,11 @@ function buildMDUrls({ coin, account_id, api_key }) {
   }
   return urls;
 }
+
 function parseMDWorkersPayload(data) {
   if (!data || typeof data !== "object") return [];
   const top = data.getuserworkers;
+
   const mapObjToArr = (miners) => {
     if (Array.isArray(miners)) {
       return miners.map((v, i) => ({
@@ -136,6 +147,7 @@ function parseMDWorkersPayload(data) {
     }
     return [];
   };
+
   if (top && top.data) return mapObjToArr(top.data.miners ?? top.data.workers ?? []);
   const node = data?.data?.workers ?? data?.workers ?? data?.data ?? null;
   if (node) return mapObjToArr(node);
@@ -172,13 +184,11 @@ async function fetchJSON(url, opts = {}, retries = 1) {
       const isAbort = e && e.name === "AbortError";
 
       if (isAbort) {
-        // timeout – tratamos como falha "limpa" sem rebentar o worker
         if (attempt > retries) {
           console.warn("[fetchJSON] timeout", { url, timeoutMs });
           return { res: null, json: null, raw: null };
         }
       } else {
-        // erro de rede / DNS / etc
         if (attempt > retries) {
           console.error("[fetchJSON] fetch failed", {
             url,
@@ -188,7 +198,6 @@ async function fetchJSON(url, opts = {}, retries = 1) {
         }
       }
 
-      // backoff entre tentativas
       await new Promise((r) =>
         setTimeout(r, 300 * attempt + Math.random() * 300)
       );
@@ -203,11 +212,13 @@ const BINANCE_BASES = [
   "https://api2.binance.com",
   "https://api3.binance.com",
 ];
+
 function signQuery(secret, params) {
   const qs = new URLSearchParams(params).toString();
   const sig = crypto.createHmac("sha256", secret).update(qs).digest("hex");
   return `${qs}&signature=${sig}`;
 }
+
 async function pickBinanceBase() {
   for (const base of BINANCE_BASES) {
     const ping = await fetchJSON(
@@ -220,12 +231,14 @@ async function pickBinanceBase() {
   }
   return null;
 }
+
 async function getServerTime(base) {
   const r = await fetchJSON(`${base}/api/v3/time`, { timeout: 7000 }, 1);
   if (!r.res?.ok) return null;
   const t = Number(r?.json?.serverTime);
   return Number.isFinite(t) ? t : null;
 }
+
 async function signedGET({ base, path, apiKey, secretKey, params, skewMs = 0 }) {
   const headers = { "X-MBX-APIKEY": apiKey };
   const p = { ...params, timestamp: Date.now() + skewMs, recvWindow: 30_000 };
@@ -236,15 +249,44 @@ async function signedGET({ base, path, apiKey, secretKey, params, skewMs = 0 }) 
 /* ========= CORE: fetch status de UM miner, com rec já carregado opcional ========= */
 async function fetchMinerStatusNormalized(minerId, preloaded) {
   let rec = preloaded;
+
+  // Carrega da BD se não foi injetado
   if (!rec) {
-    const rows = await sql`
-      SELECT id, api_key, secret_key, coin, pool, worker_name, status
-      FROM miners
-      WHERE id::text = ${String(minerId)}
-      LIMIT 1
-    `;
-    if (!rows.length) return { id: String(minerId), error: "not_found" };
-    rec = rows[0];
+    try {
+      const rows = await sql`
+        SELECT id, api_key, secret_key, coin, pool, worker_name, status
+        FROM miners
+        WHERE id::text = ${String(minerId)}
+        LIMIT 1
+      `;
+      if (!rows.length) {
+        return { id: String(minerId), error: "not_found" };
+      }
+      rec = rows[0];
+    } catch (e) {
+      console.error("[fetchMinerStatusNormalized] db error", {
+        id: String(minerId),
+        code: e?.code,
+        message: e?.message,
+      });
+
+      const errCode =
+        e && (e.code === "CONNECT_TIMEOUT" || e.errno === "CONNECT_TIMEOUT")
+          ? "db_connect_timeout"
+          : "db_error";
+
+      // fallback "verdadeiro": estamos a dizer claramente que o problema é a BD
+      return {
+        id: String(minerId),
+        worker_status: "offline",
+        hashrate_10min: 0,
+        power: null,
+        watts: null,
+        source: null,
+        worker_found: false,
+        error: errCode,
+      };
+    }
   }
 
   // não consulta pool se está em manutenção
@@ -265,12 +307,16 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
   const worker_name_db = rec.worker_name ?? "";
   const expectedTail = tail(worker_name_db);
   const expectedKey = tailKey(worker_name_db);
-  if (!expectedTail) return { id: String(minerId), error: "no_worker_name" };
+  if (!expectedTail) {
+    return { id: String(minerId), error: "no_worker_name" };
+  }
 
   let workers = [];
   let source = null;
 
-  // ====== POOLS ======
+  /* ====== POOLS ====== */
+
+  // ViaBTC
   if (pool === "ViaBTC") {
     source = "ViaBTC";
     const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${encodeURIComponent(
@@ -281,30 +327,40 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       { headers: { "X-API-KEY": api_key } },
       1
     );
-    if (!r || !r.ok || !data || data.code !== 0)
+    if (!r || !r.ok || !data || data.code !== 0) {
       return { id: String(minerId), error: "viabtc_error" };
+    }
     const list = Array.isArray(data?.data?.data) ? data.data.data : [];
     workers = list.map((w) => ({
       worker_name: String(w.worker_name ?? "").trim(),
       worker_status: w.worker_status,
       hashrate_10min: Number(w.hashrate_10min ?? 0),
     }));
-  } else if (pool === "LiteCoinPool") {
+  }
+
+  // LitecoinPool
+  else if (pool === "LiteCoinPool") {
     source = "LiteCoinPool";
     const url = `https://www.litecoinpool.org/api?api_key=${encodeURIComponent(
       api_key
     )}`;
     const { res: r, json: data } = await fetchJSON(url, {}, 1);
-    if (!r || !r.ok || !data || !data.workers)
+    if (!r || !r.ok || !data || !data.workers) {
       return { id: String(minerId), error: "ltcp_error" };
+    }
     workers = Object.entries(data.workers).map(([name, info]) => ({
       worker_name: String(name ?? "").trim(),
       worker_status: info.connected ? "active" : "unactive",
       hashrate_10min: Number((info.hash_rate ?? 0) * 1000),
     }));
-  } else if (pool === "Binance") {
+  }
+
+  // Binance Pool
+  else if (pool === "Binance") {
     source = "Binance";
-    if (!secret_key) return { id: String(minerId), error: "binance_no_secret" };
+    if (!secret_key) {
+      return { id: String(minerId), error: "binance_no_secret" };
+    }
     const { account } = splitAccountWorker(worker_name_db);
     if (!account) return { id: String(minerId), error: "binance_bad_worker" };
     const algo = mapAlgo(coin);
@@ -319,6 +375,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       secretKey: secret_key,
       params: { algo, userName: account, pageIndex: 1, pageSize: 200, sort: 0 },
     });
+
     if (L.res && !L.res.ok && L.json?.code === -1021) {
       const serverTime = await getServerTime(base);
       if (serverTime) {
@@ -328,15 +385,26 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
           path: "/sapi/v1/mining/worker/list",
           apiKey: api_key,
           secretKey: secret_key,
-          params: { algo, userName: account, pageIndex: 1, pageSize: 200, sort: 0 },
+          params: {
+            algo,
+            userName: account,
+            pageIndex: 1,
+            pageSize: 200,
+            sort: 0,
+          },
           skewMs,
         });
       }
     }
-    if (!L.res || !L.res.ok) return { id: String(minerId), error: "binance_error" };
+
+    if (!L.res || !L.res.ok) {
+      return { id: String(minerId), error: "binance_error" };
+    }
+
     const listArr = Array.isArray(L.json?.data?.workerDatas)
       ? L.json.data.workerDatas
       : [];
+
     workers = listArr.map((w) => ({
       worker_name: String(w?.workerName ?? "").trim(),
       worker_status: Number(w?.status ?? 0) === 1 ? "active" : "unactive",
@@ -349,6 +417,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
         tail(w.worker_name) === expectedTail ||
         tailKey(w.worker_name) === expectedKey
     );
+
     if (!seen) {
       let D = await signedGET({
         base,
@@ -357,6 +426,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
         secretKey: secret_key,
         params: { algo, userName: account, workerName: expectedTail },
       });
+
       if (D.res && !D.res.ok && D.json?.code === -1021) {
         const serverTime = await getServerTime(base);
         if (serverTime) {
@@ -366,11 +436,16 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
             path: "/sapi/v1/mining/worker/detail",
             apiKey: api_key,
             secretKey: secret_key,
-            params: { algo, userName: account, workerName: expectedTail },
+            params: {
+              algo,
+              userName: account,
+              workerName: expectedTail,
+            },
             skewMs,
           });
         }
       }
+
       if (D.res && D.res.ok && D.json?.data) {
         const d = D.json.data;
         workers.push({
@@ -381,7 +456,10 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
         });
       }
     }
-  } else if (pool === "F2Pool") {
+  }
+
+  // F2Pool
+  else if (pool === "F2Pool") {
     source = "F2Pool";
     const { account } = splitAccountWorker(worker_name_db);
     if (!account) return { id: String(minerId), error: "f2_bad_worker" };
@@ -397,18 +475,17 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       page: 1,
       size: 200,
     });
+
     const { res: r, json: data } = await fetchJSON(
       url,
       { method: "POST", headers, body, timeout: 15000 },
       1
     );
-    if (
-      !r ||
-      !r.ok ||
-      (data && typeof data.code === "number" && data.code !== 0)
-    ) {
+
+    if (!r || !r.ok || (data && typeof data.code === "number" && data.code !== 0)) {
       return { id: String(minerId), error: "f2_error" };
     }
+
     const arr = Array.isArray(data?.workers)
       ? data.workers
       : Array.isArray(data?.data?.workers)
@@ -418,6 +495,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       : Array.isArray(data?.list)
       ? data.list
       : [];
+
     workers = arr.map((item) => {
       const hri =
         item?.hash_rate_info ||
@@ -448,7 +526,10 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
         hashrate_10min: hr,
       };
     });
-  } else if (pool === "MiningDutch") {
+  }
+
+  // MiningDutch
+  else if (pool === "MiningDutch") {
     const { account } = splitAccountWorker(worker_name_db);
     if (!account) return { id: String(minerId), error: "md_bad_worker" };
     const urls = buildMDUrls({
@@ -456,6 +537,7 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
       account_id: account,
       api_key: rec.api_key,
     });
+
     let parsed = null;
     for (const url of urls) {
       const { res: r, json } = await fetchJSON(url, { timeout: 12000 }, 1);
@@ -466,7 +548,9 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
         break;
       }
     }
+
     if (!parsed) return { id: String(minerId), error: "md_error" };
+
     workers = parsed.map((w, i) => ({
       worker_name: String(w?.username ?? `w${i}`),
       worker_status:
@@ -475,11 +559,14 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
           : "unactive",
       hashrate_10min: Number(w?.hashrate ?? 0),
     }));
-  } else {
+  }
+
+  // Pool desconhecida
+  else {
     return { id: String(minerId), error: "unsupported_pool" };
   }
 
-  // pick worker por tail
+  // pick worker por tail/key
   const expectedTailStr = tail(rec.worker_name);
   const expectedKeyStr = tailKey(rec.worker_name);
   const my =
@@ -529,6 +616,7 @@ export async function getMinerStatus(req, res) {
 export async function getMinersStatusMany(req, res) {
   const raw = String(req.query.ids ?? "").trim();
   if (!raw) return res.status(400).json({ error: "ids vazios" });
+
   const ids = raw
     .split(",")
     .map((s) => s.trim())
@@ -548,6 +636,7 @@ export async function getMinersStatusMany(req, res) {
     }
   }
 
+  // Se tudo veio de cache, respondemos já
   if (!toFetch.length) {
     const map = new Map(out.map((o) => [o.id, o]));
     const ordered = ids.map(
@@ -558,19 +647,59 @@ export async function getMinersStatusMany(req, res) {
           hashrate_10min: 0,
           power: null,
           watts: null,
+          worker_found: false,
+          error: "no_cached_data",
         }
     );
     return res.json(ordered);
   }
 
+  // helper para fallback quando não conseguimos ir ao DB
+  function buildFallbackMany(errorCode) {
+    const mapCached = new Map(out.map((o) => [o.id, o]));
+    return ids.map((id) => {
+      const cached = mapCached.get(id);
+      if (cached) return cached;
+      return {
+        id,
+        worker_status: "offline",
+        hashrate_10min: 0,
+        power: null,
+        watts: null,
+        worker_found: false,
+        error: errorCode,
+      };
+    });
+  }
+
   try {
-    const rows = await sql`
-      SELECT id, api_key, secret_key, coin, pool, worker_name, status
-      FROM miners
-      WHERE id::text = ANY(${toFetch})
-    `;
+    // 2) carregar recs das miners a partir da Neon
+    let rows;
+    try {
+      rows = await sql`
+        SELECT id, api_key, secret_key, coin, pool, worker_name, status
+        FROM miners
+        WHERE id::text = ANY(${toFetch})
+      `;
+    } catch (e) {
+      console.error("[getMinersStatusMany] db error", {
+        ids: toFetch,
+        code: e?.code,
+        message: e?.message,
+      });
+
+      const errCode =
+        e && (e.code === "CONNECT_TIMEOUT" || e.errno === "CONNECT_TIMEOUT")
+          ? "db_connect_timeout"
+          : "db_error";
+
+      const ordered = buildFallbackMany(errCode);
+      return res.json(ordered);
+    }
+
     const mapMiner = new Map(rows.map((r) => [String(r.id), r]));
 
+    // 3) concorrência limitada a 4 workers
     const CONC = 4;
     const queue = [...toFetch];
     const outBatch = [];
@@ -593,7 +722,10 @@ export async function getMinersStatusMany(req, res) {
 
     await Promise.all(workersPromises);
 
-    const mapOut = new Map(outBatch.map((o) => [o.id, o]));
+    const mapOut = new Map(
+      [...out, ...outBatch].map((o) => [o.id, o])
+    );
+
     const ordered = ids.map(
       (id) =>
         mapOut.get(id) || {
@@ -602,11 +734,15 @@ export async function getMinersStatusMany(req, res) {
           hashrate_10min: 0,
           power: null,
           watts: null,
+          worker_found: false,
+          error: "no_data",
         }
     );
-    res.json(ordered);
+
+    return res.json(ordered);
   } catch (e) {
     console.error("getMinersStatusMany error:", e);
-    res.status(500).json({ error: "internal_error" });
+    const ordered = buildFallbackMany("internal_error");
+    return res.json(ordered);
   }
 }
