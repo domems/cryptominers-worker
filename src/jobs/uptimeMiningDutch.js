@@ -1,10 +1,25 @@
 // src/jobs/uptimeMiningDutch.js
 import cron from "node-cron";
-import fetch from "node-fetch";
+import fetchOrig from "node-fetch";
 import { sql } from "../config/db.js";
 import { redis } from "../config/upstash.js";
 
-/* ===== time slot (15 min, UTC) ===== */
+/* =============================== */
+/* Logger + config                 */
+/* =============================== */
+const TAG = "[uptime:miningdutch]";
+const DEBUG =
+  (process.env.DEBUG_UPTIME_MININGDUTCH ?? "false").toLowerCase() === "true";
+
+// janela de tolerância para assumir que continua online
+const GRACE_MINUTES = 30;
+
+// usa fetch global se existir, senão node-fetch
+const fetch = globalThis.fetch || fetchOrig;
+
+/* =============================== */
+/* time slot (15 min, UTC)         */
+/* =============================== */
 function slotISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
@@ -21,7 +36,9 @@ function slotISO(d = new Date()) {
   return t.toISOString();
 }
 
-/* ===== helpers ===== */
+/* =============================== */
+/* helpers                         */
+/* =============================== */
 const norm = (s) => String(s ?? "").trim();
 const low = (s) => norm(s).toLowerCase();
 const tail = (s) => {
@@ -34,6 +51,13 @@ const head = (s) => {
   const i = str.indexOf(".");
   return i >= 0 ? str.slice(0, i) : str;
 };
+
+function minutesDiff(aISO, bISO) {
+  const a = new Date(aISO).getTime();
+  const b = new Date(bISO).getTime();
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return Infinity;
+  return Math.abs(b - a) / (60 * 1000);
+}
 
 function algoFromCoin(coin) {
   const c = String(coin || "").trim().toUpperCase();
@@ -67,21 +91,27 @@ function buildCandidateUrls({ coin, account_id, api_key }) {
 }
 
 function isOnlineFromWorker(w) {
-  // Mining-Dutch: alive=1/0, hashrate number
+  // Mining-Dutch: alive=1/0, hashrate number, status string
   const alive = Number(w?.alive ?? w?.online ?? 0);
   if (!Number.isNaN(alive) && alive > 0) return true;
+
   const hr = Number(w?.hashrate ?? w?.hash ?? 0);
   if (!Number.isNaN(hr) && hr > 0) return true;
+
   const st = low(w?.status);
   if (
     st &&
     ["alive", "online", "active", "up", "working", "connected"].includes(st)
-  )
+  ) {
     return true;
+  }
+
   return false;
 }
 
-/** parser robusto para os formatos da Mining-Dutch */
+/* =============================== */
+/* parser robusto                  */
+/* =============================== */
 function parseWorkersPayload(data) {
   if (!data || typeof data !== "object") return null;
 
@@ -139,29 +169,60 @@ function parseWorkersPayload(data) {
   return null;
 }
 
+/* =============================== */
+/* fetch com logs                  */
+/* =============================== */
 async function fetchMiningDutchWorkers({ coin, account_id, api_key }) {
   const urls = buildCandidateUrls({ coin, account_id, api_key });
   let lastErr;
 
   for (const url of urls) {
+    const started = Date.now();
     try {
+      if (DEBUG) {
+        console.log(TAG, "FETCH_BEGIN", { url, coin, account_id });
+      }
+
       const res = await fetch(url, { timeout: 12_000 });
+      const ms = Date.now() - started;
+
       if (!res.ok) {
-        console.warn("[miningdutch] HTTP", res.status, url);
+        const text = await res.text().catch(() => "<no-body>");
+        console.warn(TAG, "HTTP_ERROR", {
+          url,
+          status: res.status,
+          ms,
+          body: text.slice(0, 300),
+        });
         lastErr = new Error(`HTTP ${res.status}`);
         continue;
       }
+
       const data = await res.json().catch(() => null);
       const list = parseWorkersPayload(data);
+
       if (!list) {
         console.warn(
-          "[miningdutch] schema inesperado",
+          TAG,
+          "SCHEMA_UNEXPECTED",
           url,
           JSON.stringify(data)?.slice(0, 300)
         );
         continue;
       }
-      // normalização final (usar username como nome se existir)
+
+      if (DEBUG) {
+        console.log(TAG, "FETCH_OK", {
+          url,
+          ms,
+          count: list.length,
+          sample: list[0]
+            ? { name: list[0].name, status: list[0].status }
+            : null,
+        });
+      }
+
+      // normalização final
       return list.map((w) => ({
         name: norm(w.name || w.username),
         hashrate: Number(w.hashrate || 0),
@@ -170,22 +231,68 @@ async function fetchMiningDutchWorkers({ coin, account_id, api_key }) {
         raw: w.raw || {},
       }));
     } catch (e) {
+      const ms = Date.now() - started;
       lastErr = e;
-      console.warn("[miningdutch] erro", url, e?.message || e);
+      console.warn(TAG, "FETCH_FAIL", {
+        url,
+        ms,
+        error: e?.message || String(e),
+      });
     }
   }
+
   throw lastErr ?? new Error("All MiningDutch endpoints failed");
 }
 
-/* ===== controle de slot para não somar horas 2x/slot ===== */
+/* =============================== */
+/* auxiliar: classificar offline   */
+/* com GRACE (histórico)          */
+/* =============================== */
+async function classifyOfflineWithGrace(
+  m,
+  slot,
+  fallbackOnlineIds,
+  offlineIdsConfirmed
+) {
+  const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
+  const statusLower = low(m.status);
+  let treatedOnline = false;
+
+  try {
+    const last = await redis.get(redisKey);
+    if (
+      (last && minutesDiff(last, slot) <= GRACE_MINUTES) ||
+      statusLower === "online"
+    ) {
+      treatedOnline = true;
+    }
+  } catch (e) {
+    console.warn(TAG, "redis.get lastOnline failed", {
+      id: m.id,
+      error: e?.message || String(e),
+    });
+  }
+
+  if (treatedOnline) {
+    fallbackOnlineIds.push(m.id);
+  } else {
+    offlineIdsConfirmed.push(m.id);
+  }
+}
+
+/* =============================== */
+/* controle de slot                */
+/* =============================== */
 let lastSlot = null;
 const updatedInSlot = new Set();
+
 function beginSlot(s) {
   if (s !== lastSlot) {
     lastSlot = s;
     updatedInSlot.clear();
   }
 }
+
 function dedupeForHours(ids) {
   const out = [];
   for (const id of ids) {
@@ -197,15 +304,23 @@ function dedupeForHours(ids) {
   return out;
 }
 
-/* ===== job principal ===== */
+/* =============================== */
+/* job principal                   */
+/* =============================== */
 export async function runUptimeMiningDutchOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
 
+  if (DEBUG) {
+    console.log(TAG, "RUN_BEGIN", { slot: sISO });
+  }
+
   const lockKey = `uptime:${sISO}:miningdutch`;
   const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 20 * 60 });
   if (!gotLock) {
-    console.log(`[uptime:miningdutch] lock ativo (${sISO}) – skip.`);
+    if (DEBUG) {
+      console.log(TAG, "LOCK_SKIP", { slot: sISO });
+    }
     return { ok: true, skipped: true };
   }
 
@@ -215,61 +330,245 @@ export async function runUptimeMiningDutchOnce() {
 
   try {
     const miners = await sql/*sql*/`
-      SELECT id, worker_name, api_key, coin
+      SELECT id, worker_name, api_key, coin, status
       FROM miners
       WHERE pool = 'MiningDutch'
         AND api_key IS NOT NULL AND api_key <> ''
         AND worker_name IS NOT NULL AND worker_name <> ''
     `;
-    if (!miners.length)
+
+    if (!miners.length) {
+      if (DEBUG) {
+        console.log(TAG, "NO_MINERS");
+      }
       return { ok: true, updated: 0, statusChanged: 0 };
+    }
 
     // group by api_key + account_id (head(worker_name)) + coin
     const groups = new Map();
     for (const m of miners) {
       const account_id = head(m.worker_name);
       const key = `${m.api_key}::${account_id}::${m.coin || ""}`;
-      if (!groups.has(key))
+      if (!groups.has(key)) {
         groups.set(key, {
           account_id,
           api_key: m.api_key,
           coin: m.coin,
           list: [],
         });
+      }
       groups.get(key).list.push(m);
     }
 
     for (const [, grp] of groups) {
       const { account_id, api_key, coin, list } = grp;
-      const onlineIdsRaw = [];
-      const offlineIdsRaw = [];
 
-      try {
-        const workers = await fetchMiningDutchWorkers({
-          coin,
+      if (DEBUG) {
+        console.log(TAG, "GROUP_BEGIN", {
           account_id,
-          api_key,
+          coin,
+          miners: list.length,
         });
-
-        // index por tail (lowercase)
-        const byTail = new Map();
-        for (const w of workers)
-          byTail.set(low(tail(w.name) || w.name), w);
-
-        for (const m of list) {
-          const t = low(tail(m.worker_name));
-          const info = byTail.get(t);
-          const apiOnline = !!(info && isOnlineFromWorker(info));
-          if (apiOnline) onlineIdsRaw.push(m.id);
-          else offlineIdsRaw.push(m.id);
-        }
-      } catch (e) {
-        console.error("[uptime:miningdutch] erro grupo", { account_id, coin }, e?.message || e);
-        for (const m of list) offlineIdsRaw.push(m.id);
       }
 
-      // 1) Horas online (dedupe por slot) — NÃO contar se em manutenção
-      const onlineIdsForHours = dedupeForHours(onlineIdsRaw);
+      const onlineIdsConfirmed = [];   // API confirmou online
+      const offlineIdsConfirmed = [];  // offline "real" (API + sem GRACE ou transição confirmada)
+      const fallbackOnlineIds = [];    // tratado como online para horas (GRACE ou slot de transição)
+
+      /* ---------- 1) Fetch com retry de grupo ---------- */
+      let workers = null;
+      let groupFullyFailed = false;
+
+      try {
+        try {
+          workers = await fetchMiningDutchWorkers({
+            coin,
+            account_id,
+            api_key,
+          });
+        } catch (e1) {
+          console.error(
+            TAG,
+            "GROUP_FETCH_ERROR_FIRST",
+            { account_id, coin },
+            e1?.message || String(e1)
+          );
+
+          // retry total do grupo
+          try {
+            workers = await fetchMiningDutchWorkers({
+              coin,
+              account_id,
+              api_key,
+            });
+            console.warn(TAG, "GROUP_FETCH_RECOVERED", {
+              account_id,
+              coin,
+            });
+          } catch (e2) {
+            console.error(
+              TAG,
+              "GROUP_FETCH_ERROR_SECOND",
+              { account_id, coin },
+              e2?.message || String(e2)
+            );
+            groupFullyFailed = true;
+          }
+        }
+
+        if (groupFullyFailed || !workers) {
+          // API deste grupo está mesmo fodida neste slot → só histórico
+          for (const m of list) {
+            await classifyOfflineWithGrace(
+              m,
+              sISO,
+              fallbackOnlineIds,
+              offlineIdsConfirmed
+            );
+          }
+        } else {
+          /* ---------- 2) 1ª classificação com base no 1º fetch ---------- */
+          const byTail = new Map();
+          for (const w of workers) {
+            const keyTail = low(tail(w.name) || w.name);
+            if (keyTail) byTail.set(keyTail, w);
+          }
+
+          const suspicious = [];       // offline mas BD dizia online
+          const offlineCandidates = []; // resto dos offline
+
+          for (const m of list) {
+            const t = low(tail(m.worker_name));
+            const info = t ? byTail.get(t) : null;
+            const apiOnline = !!(info && isOnlineFromWorker(info));
+            const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
+
+            if (apiOnline) {
+              // API garantiu online → aceitamos
+              onlineIdsConfirmed.push(m.id);
+              try {
+                await redis.set(redisKey, sISO, { ex: 7 * 24 * 60 * 60 });
+              } catch (e) {
+                console.warn(TAG, "redis.set lastOnline failed", {
+                  id: m.id,
+                  error: e?.message || String(e),
+                });
+              }
+            } else {
+              const statusLower = low(m.status);
+              if (statusLower === "online") {
+                // EXACTAMENTE o caso: API diz offline mas BD está online
+                suspicious.push(m);
+              } else {
+                offlineCandidates.push(m);
+              }
+            }
+          }
+
+          /* ---------- 3) 2ª chamada só para os "suspeitos" ---------- */
+          if (suspicious.length) {
+            let workersRetry = null;
+            try {
+              workersRetry = await fetchMiningDutchWorkers({
+                coin,
+                account_id,
+                api_key,
+              });
+              console.warn(TAG, "SUSPICIOUS_RETRY", {
+                account_id,
+                coin,
+                count: suspicious.length,
+              });
+            } catch (eRetry) {
+              console.error(
+                TAG,
+                "SUSPICIOUS_RETRY_FAIL",
+                { account_id, coin },
+                eRetry?.message || String(eRetry)
+              );
+            }
+
+            let byTailRetry = null;
+            if (workersRetry && Array.isArray(workersRetry)) {
+              byTailRetry = new Map();
+              for (const w of workersRetry) {
+                const keyTail = low(tail(w.name) || w.name);
+                if (keyTail) byTailRetry.set(keyTail, w);
+              }
+            }
+
+            for (const m of suspicious) {
+              const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
+
+              if (byTailRetry) {
+                const t = low(tail(m.worker_name));
+                const info2 = t ? byTailRetry.get(t) : null;
+                const apiOnline2 = !!(info2 && isOnlineFromWorker(info2));
+
+                if (apiOnline2) {
+                  // 2ª chamada corrigiu → tratamos como online (confirmado)
+                  onlineIdsConfirmed.push(m.id);
+                  try {
+                    await redis.set(redisKey, sISO, { ex: 7 * 24 * 60 * 60 });
+                  } catch (e) {
+                    console.warn(TAG, "redis.set lastOnline (retry) failed", {
+                      id: m.id,
+                      error: e?.message || String(e),
+                    });
+                  }
+                  continue; // próximo suspeito
+                }
+              }
+
+              // === 2ª chamada continuou a dar offline ===
+              // Lógica que acordámos:
+              // 1) ESTE slot ainda conta horas como online (último 15 min)
+              fallbackOnlineIds.push(m.id);
+
+              // 2) Estado passa mesmo a OFFLINE daqui para a frente
+              offlineIdsConfirmed.push(m.id);
+
+              // 3) Limpar histórico para não ficar "online para sempre" por GRACE
+              try {
+                await redis.del(redisKey);
+              } catch (e) {
+                console.warn(
+                  TAG,
+                  "redis.del lastOnline (confirmed offline) failed",
+                  {
+                    id: m.id,
+                    error: e?.message || String(e),
+                  }
+                );
+              }
+            }
+          }
+
+          /* ---------- 4) GRACE para os offline restantes ---------- */
+          for (const m of offlineCandidates) {
+            await classifyOfflineWithGrace(
+              m,
+              sISO,
+              fallbackOnlineIds,
+              offlineIdsConfirmed
+            );
+          }
+        }
+      } catch (eGroup) {
+        console.error(
+          TAG,
+          "GROUP_FATAL",
+          { account_id, coin },
+          eGroup?.message || String(eGroup)
+        );
+      }
+
+      /* ---------- 5) Aplicar horas + estados para este grupo ---------- */
+      // Horas online (confirmed + fallback, dedupe por slot)
+      const onlineIdsForHours = dedupeForHours([
+        ...onlineIdsConfirmed,
+        ...fallbackOnlineIds,
+      ]);
       if (onlineIdsForHours.length) {
         await sql/*sql*/`
           UPDATE miners
@@ -280,46 +579,54 @@ export async function runUptimeMiningDutchOnce() {
         hoursUpdated += onlineIdsForHours.length;
       }
 
-      // 2) Status (só quando muda) — IGNORAR manutenção
-      if (onlineIdsRaw.length) {
+      // Status – só mexemos com base em informação "forte"
+      if (onlineIdsConfirmed.length) {
         const r1 = await sql/*sql*/`
           UPDATE miners
           SET status = 'online'
-          WHERE id = ANY(${onlineIdsRaw})
+          WHERE id = ANY(${onlineIdsConfirmed})
             AND status IS DISTINCT FROM 'online'
             AND lower(COALESCE(status, '')) <> 'maintenance'
           RETURNING id
         `;
-        statusToOnline += Array.isArray(r1)
-          ? r1.length
-          : r1?.count || 0;
+        statusToOnline += Array.isArray(r1) ? r1.length : r1?.count || 0;
       }
-      if (offlineIdsRaw.length) {
+
+      if (offlineIdsConfirmed.length) {
         const r2 = await sql/*sql*/`
           UPDATE miners
           SET status = 'offline'
-          WHERE id = ANY(${offlineIdsRaw})
+          WHERE id = ANY(${offlineIdsConfirmed})
             AND status IS DISTINCT FROM 'offline'
             AND lower(COALESCE(status, '')) <> 'maintenance'
           RETURNING id
         `;
-        statusToOffline += Array.isArray(r2)
-          ? r2.length
-          : r2?.count || 0;
+        statusToOffline += Array.isArray(r2) ? r2.length : r2?.count || 0;
       }
 
-      console.log(
-        `[uptime:miningdutch] acct=${account_id} coin=${
-          coin || "-"
-        } workers=${list.length} onlineAPI=${onlineIdsRaw.length} offlineAPI=${
-          offlineIdsRaw.length
-        }`
-      );
+      if (DEBUG) {
+        console.log(TAG, "GROUP_DONE", {
+          account_id,
+          coin,
+          workers: list.length,
+          onlineConfirmed: onlineIdsConfirmed.length,
+          offlineConfirmed: offlineIdsConfirmed.length,
+          fallbackOnline: fallbackOnlineIds.length,
+        });
+      }
     }
 
     const statusChanged = statusToOnline + statusToOffline;
     console.log(
-      `[uptime:miningdutch] ${sISO} – horas+: ${hoursUpdated}, ->online: ${statusToOnline}, ->offline: ${statusToOffline}`
+      TAG,
+      "RUN_DONE",
+      sISO,
+      "horas+:",
+      hoursUpdated,
+      "->online:",
+      statusToOnline,
+      "->offline:",
+      statusToOffline
     );
     return { ok: true, updated: hoursUpdated, statusChanged };
   } catch (e) {
@@ -328,6 +635,9 @@ export async function runUptimeMiningDutchOnce() {
   }
 }
 
+/* =============================== */
+/* cron                            */
+/* =============================== */
 export function startUptimeMiningDutch() {
   cron.schedule(
     "*/15 * * * *",
@@ -338,7 +648,9 @@ export function startUptimeMiningDutch() {
         console.error("⛔ miningdutch cron:", e);
       }
     },
-    { timezone: "Europe/Lisbon" }
+    {
+      timezone: "Europe/Lisbon", 
+    }
   );
   console.log("[jobs] MiningDutch (*/15) agendado.");
 }
