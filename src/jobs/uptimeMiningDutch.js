@@ -11,11 +11,8 @@ const TAG = "[uptime:miningdutch]";
 const DEBUG =
   (process.env.DEBUG_UPTIME_MININGDUTCH ?? "false").toLowerCase() === "true";
 
-// janela de tolerância para faturação (assumir que continua online)
+// janela de tolerância para assumir que continua online
 const GRACE_MINUTES = 30;
-
-// tempo mínimo de "offline" para confirmar estado offline (pelo menos 2 slots)
-const OFFLINE_CONFIRM_MIN = 30;
 
 // usa fetch global se existir, senão node-fetch
 const fetch = globalThis.fetch || fetchOrig;
@@ -248,6 +245,74 @@ async function fetchMiningDutchWorkers({ coin, account_id, api_key }) {
 }
 
 /* =============================== */
+/* auxiliar: classificar offline   */
+/* com GRACE (histórico)          */
+/* =============================== */
+async function classifyOfflineWithGrace(
+  m,
+  slot,
+  fallbackOnlineIds,
+  offlineIdsConfirmed
+) {
+  const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
+  const statusLower = low(m.status);
+  let treatedOnline = false;
+
+  try {
+    const last = await redis.get(redisKey);
+    if (
+      (last && minutesDiff(last, slot) <= GRACE_MINUTES) ||
+      statusLower === "online"
+    ) {
+      treatedOnline = true;
+    }
+  } catch (e) {
+    console.warn(TAG, "redis.get lastOnline failed", {
+      id: m.id,
+      error: e?.message || String(e),
+    });
+  }
+
+  if (treatedOnline) {
+    // considera online neste slot (horas), mas NÃO mexe estado aqui
+    fallbackOnlineIds.push(m.id);
+  } else {
+    // só é usado quando a API devolveu explicitamente este worker como offline
+    offlineIdsConfirmed.push(m.id);
+  }
+}
+
+/**
+ * Versão para ERRO de API / worker não devolvido:
+ * - Se esteve online recentemente (GRACE) → conta horas (fallbackOnlineIds)
+ * - Nunca adiciona a offlineIdsConfirmed (não muda status para offline).
+ */
+async function classifyErrorWithGrace(m, slot, fallbackOnlineIds) {
+  const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
+  const statusLower = low(m.status);
+  let treatedOnline = false;
+
+  try {
+    const last = await redis.get(redisKey);
+    if (
+      (last && minutesDiff(last, slot) <= GRACE_MINUTES) ||
+      statusLower === "online"
+    ) {
+      treatedOnline = true;
+    }
+  } catch (e) {
+    console.warn(TAG, "redis.get lastOnline (error) failed", {
+      id: m.id,
+      error: e?.message || String(e),
+    });
+  }
+
+  if (treatedOnline) {
+    fallbackOnlineIds.push(m.id);
+  }
+}
+
+/* =============================== */
 /* controle de slot                */
 /* =============================== */
 let lastSlot = null;
@@ -305,7 +370,9 @@ export async function runUptimeMiningDutchOnce() {
     `;
 
     if (!miners.length) {
-      if (DEBUG) console.log(TAG, "NO_MINERS");
+      if (DEBUG) {
+        console.log(TAG, "NO_MINERS");
+      }
       return { ok: true, updated: 0, statusChanged: 0 };
     }
 
@@ -336,17 +403,21 @@ export async function runUptimeMiningDutchOnce() {
         });
       }
 
-      const billingOnlineIds = [];   // ids a contar horas neste slot
-      const statusOnlineIds = [];    // ids para marcar status=online
-      const statusOfflineIds = [];   // ids para marcar status=offline
+      const onlineIdsConfirmed = [];   // API confirmou online
+      const offlineIdsConfirmed = [];  // API confirmou offline
+      const fallbackOnlineIds = [];    // online por GRACE (erro/ transição)
 
+      /* ---------- 1) Fetch com retry de grupo ---------- */
       let workers = null;
       let groupFullyFailed = false;
 
-      // ===== 1) fetch com retry de grupo =====
       try {
         try {
-          workers = await fetchMiningDutchWorkers({ coin, account_id, api_key });
+          workers = await fetchMiningDutchWorkers({
+            coin,
+            account_id,
+            api_key,
+          });
         } catch (e1) {
           console.error(
             TAG,
@@ -354,13 +425,18 @@ export async function runUptimeMiningDutchOnce() {
             { account_id, coin },
             e1?.message || String(e1)
           );
+
+          // retry total do grupo
           try {
             workers = await fetchMiningDutchWorkers({
               coin,
               account_id,
               api_key,
             });
-            console.warn(TAG, "GROUP_FETCH_RECOVERED", { account_id, coin });
+            console.warn(TAG, "GROUP_FETCH_RECOVERED", {
+              account_id,
+              coin,
+            });
           } catch (e2) {
             console.error(
               TAG,
@@ -371,154 +447,172 @@ export async function runUptimeMiningDutchOnce() {
             groupFullyFailed = true;
           }
         }
-      } catch (e) {
-        console.error(
-          TAG,
-          "GROUP_FATAL_FETCH",
-          { account_id, coin },
-          e?.message || String(e)
-        );
-        groupFullyFailed = true;
-      }
 
-      if (groupFullyFailed || !workers) {
-        // API indisponível -> não mexemos status; só faturação via histórico
-        for (const m of list) {
-          const statusLower = low(m.status);
-          const lastOnlineKey = `uptime:lastOnline:miningdutch:${m.id}`;
-          let treatOnline = false;
-          try {
-            const last = await redis.get(lastOnlineKey);
-            if (last && minutesDiff(last, sISO) <= GRACE_MINUTES) {
-              treatOnline = true;
-            } else if (statusLower === "online") {
-              treatOnline = true;
-            }
-          } catch (e) {
-            console.warn(TAG, "redis.get lastOnline (groupFail) failed", {
-              id: m.id,
-              error: e?.message || String(e),
-            });
+        if (groupFullyFailed || !workers) {
+          // API deste grupo está mesmo fodida neste slot:
+          // → NUNCA marcamos offline
+          // → Só somamos horas se GRACE disser que esteve online há pouco
+          for (const m of list) {
+            await classifyErrorWithGrace(m, sISO, fallbackOnlineIds);
           }
-          if (treatOnline) billingOnlineIds.push(m.id);
-        }
-      } else {
-        // ===== 2) API respondeu -> tratamos online/offline com GRACE + candidatos =====
-        const byTail = new Map();
-        for (const w of workers) {
-          const keyTail = low(tail(w.name) || w.name);
-          if (keyTail) byTail.set(keyTail, w);
-        }
+        } else {
+          /* ---------- 2) 1ª classificação com base no 1º fetch ---------- */
+          const byTail = new Map();
+          for (const w of workers) {
+            const keyTail = low(tail(w.name) || w.name);
+            if (keyTail) byTail.set(keyTail, w);
+          }
 
-        for (const m of list) {
-          const t = low(tail(m.worker_name));
-          const info = t ? byTail.get(t) : null;
-          const apiOnline = !!(info && isOnlineFromWorker(info));
+          const suspicious = [];        // API offline mas BD dizia online
+          const offlineCandidates = []; // API offline (com info) para BD ≠ online
+          const noInfo = [];            // worker não apareceu na resposta → tratar como "erro"
 
-          const statusLower = low(m.status);
-          const lastOnlineKey = `uptime:lastOnline:miningdutch:${m.id}`;
-          const offlineCandKey = `uptime:lastOfflineCandidate:miningdutch:${m.id}`;
+          for (const m of list) {
+            const t = low(tail(m.worker_name));
+            const info = t ? byTail.get(t) : null;
+            const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
 
-          if (apiOnline) {
-            // ========= ONLINE pela API =========
-            billingOnlineIds.push(m.id);
-            statusOnlineIds.push(m.id);
+            if (info) {
+              const apiOnline = isOnlineFromWorker(info);
 
-            try {
-              await Promise.all([
-                redis.set(lastOnlineKey, sISO, { ex: 7 * 24 * 60 * 60 }),
-                redis.del(offlineCandKey),
-              ]);
-            } catch (e) {
-              console.warn(TAG, "redis set/del (online) failed", {
-                id: m.id,
-                error: e?.message || String(e),
-              });
-            }
-          } else {
-            // ========= OFFLINE segundo a API =========
-            let lastOnline = null;
-            let offlineCandidate = null;
-            try {
-              const [last, cand] = await Promise.all([
-                redis.get(lastOnlineKey),
-                redis.get(offlineCandKey),
-              ]);
-              lastOnline = last;
-              offlineCandidate = cand;
-            } catch (e) {
-              console.warn(TAG, "redis.get lastOnline/offlineCand failed", {
-                id: m.id,
-                error: e?.message || String(e),
-              });
-            }
-
-            // ---- faturação (GRACE) ----
-            let treatOnline = false;
-            if (lastOnline && minutesDiff(lastOnline, sISO) <= GRACE_MINUTES) {
-              treatOnline = true;
-            } else if (statusLower === "online") {
-              treatOnline = true;
-            }
-            if (treatOnline) billingOnlineIds.push(m.id);
-
-            // ---- estado (status) ----
-            if (statusLower === "offline") {
-              // já está offline confirmado -> mantemos, só limpamos candidato se houver
-              if (offlineCandidate) {
+              if (apiOnline) {
+                // API garantiu online → aceitamos
+                onlineIdsConfirmed.push(m.id);
                 try {
-                  await redis.del(offlineCandKey);
+                  await redis.set(redisKey, sISO, { ex: 7 * 24 * 60 * 60 });
                 } catch (e) {
-                  console.warn(TAG, "redis.del offlineCand (already offline) failed", {
-                    id: m.id,
-                    error: e?.message || String(e),
-                  });
-                }
-              }
-            } else {
-              // ainda não está offline na BD -> candidato a ficar offline
-              if (!offlineCandidate) {
-                // primeiro slot a ver offline -> marca candidato
-                try {
-                  await redis.set(offlineCandKey, sISO, {
-                    ex: 7 * 24 * 60 * 60,
-                  });
-                } catch (e) {
-                  console.warn(TAG, "redis.set offlineCand failed", {
+                  console.warn(TAG, "redis.set lastOnline failed", {
                     id: m.id,
                     error: e?.message || String(e),
                   });
                 }
               } else {
-                // já havia candidato, ver se passou do tempo mínimo
-                if (minutesDiff(offlineCandidate, sISO) >= OFFLINE_CONFIRM_MIN) {
-                  // agora sim: confirmamos OFFLINE
-                  statusOfflineIds.push(m.id);
-                  try {
-                    await Promise.all([
-                      redis.del(offlineCandKey),
-                      redis.del(lastOnlineKey),
-                    ]);
-                  } catch (e) {
-                    console.warn(
-                      TAG,
-                      "redis.del offlineCand/lastOnline (confirm offline) failed",
-                      {
-                        id: m.id,
-                        error: e?.message || String(e),
-                      }
-                    );
-                  }
+                const statusLower = low(m.status);
+                if (statusLower === "online") {
+                  // EXACTAMENTE o caso: API diz offline mas BD está online
+                  suspicious.push(m);
+                } else {
+                  // API disse offline e BD já não está online → candidato normal a offline
+                  offlineCandidates.push(m);
                 }
-                // se ainda não passou OFFLINE_CONFIRM_MIN, não mudamos o status
+              }
+            } else {
+              // Worker não veio na resposta → tratamos como erro/inconclusivo,
+              // não marcamos offline por isto, apenas usamos GRACE para horas.
+              noInfo.push(m);
+            }
+          }
+
+          /* ---------- 3) 2ª chamada só para os "suspeitos" ---------- */
+          if (suspicious.length) {
+            let workersRetry = null;
+            try {
+              workersRetry = await fetchMiningDutchWorkers({
+                coin,
+                account_id,
+                api_key,
+              });
+              console.warn(TAG, "SUSPICIOUS_RETRY", {
+                account_id,
+                coin,
+                count: suspicious.length,
+              });
+            } catch (eRetry) {
+              console.error(
+                TAG,
+                "SUSPICIOUS_RETRY_FAIL",
+                { account_id, coin },
+                eRetry?.message || String(eRetry)
+              );
+            }
+
+            let byTailRetry = null;
+            if (workersRetry && Array.isArray(workersRetry)) {
+              byTailRetry = new Map();
+              for (const w of workersRetry) {
+                const keyTail = low(tail(w.name) || w.name);
+                if (keyTail) byTailRetry.set(keyTail, w);
+              }
+            }
+
+            for (const m of suspicious) {
+              const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
+
+              if (byTailRetry) {
+                const t = low(tail(m.worker_name));
+                const info2 = t ? byTailRetry.get(t) : null;
+                const apiOnline2 = !!(info2 && isOnlineFromWorker(info2));
+
+                if (apiOnline2) {
+                  // 2ª chamada corrigiu → tratamos como online (confirmado)
+                  onlineIdsConfirmed.push(m.id);
+                  try {
+                    await redis.set(redisKey, sISO, { ex: 7 * 24 * 60 * 60 });
+                  } catch (e) {
+                    console.warn(TAG, "redis.set lastOnline (retry) failed", {
+                      id: m.id,
+                      error: e?.message || String(e),
+                    });
+                  }
+                  continue; // próximo suspeito
+                }
+              }
+
+              // === 2ª chamada continuou a dar offline ===
+              // ESTE slot ainda conta horas como online (último 15 min)
+              fallbackOnlineIds.push(m.id);
+
+              // Estado passa OFFLINE daqui para a frente (API insistiu offline)
+              offlineIdsConfirmed.push(m.id);
+
+              // Limpar histórico para não ficar "online para sempre" por GRACE
+              try {
+                await redis.del(redisKey);
+              } catch (e) {
+                console.warn(
+                  TAG,
+                  "redis.del lastOnline (confirmed offline) failed",
+                  {
+                    id: m.id,
+                    error: e?.message || String(e),
+                  }
+                );
               }
             }
           }
+
+          /* ---------- 4) GRACE para os offline restantes ---------- */
+          for (const m of offlineCandidates) {
+            // Aqui só entra quem a API retornou explicitamente offline
+            await classifyOfflineWithGrace(
+              m,
+              sISO,
+              fallbackOnlineIds,
+              offlineIdsConfirmed
+            );
+          }
+
+          /* ---------- 5) "Erro"/sem info: só GRACE para horas ---------- */
+          for (const m of noInfo) {
+            // Nunca marca offline por não aparecer na resposta
+            await classifyErrorWithGrace(m, sISO, fallbackOnlineIds);
+          }
         }
+      } catch (eGroup) {
+        console.error(
+          TAG,
+          "GROUP_FATAL",
+          { account_id, coin },
+          eGroup?.message || String(eGroup)
+        );
       }
 
-      // ===== 3) aplicar faturação (horas) =====
-      const onlineIdsForHours = dedupeForHours(billingOnlineIds);
+      /* ---------- 5) Aplicar horas + estados para este grupo ---------- */
+      // Horas online (confirmed + fallback, dedupe por slot)
+      const onlineIdsForHours = dedupeForHours([
+        ...onlineIdsConfirmed,
+        ...fallbackOnlineIds,
+      ]);
       if (onlineIdsForHours.length) {
         await sql/*sql*/`
           UPDATE miners
@@ -529,12 +623,12 @@ export async function runUptimeMiningDutchOnce() {
         hoursUpdated += onlineIdsForHours.length;
       }
 
-      // ===== 4) aplicar estados (status) =====
-      if (statusOnlineIds.length) {
+      // Status – só mexemos com base em informação "forte"
+      if (onlineIdsConfirmed.length) {
         const r1 = await sql/*sql*/`
           UPDATE miners
           SET status = 'online'
-          WHERE id = ANY(${statusOnlineIds})
+          WHERE id = ANY(${onlineIdsConfirmed})
             AND status IS DISTINCT FROM 'online'
             AND lower(COALESCE(status, '')) <> 'maintenance'
           RETURNING id
@@ -542,11 +636,11 @@ export async function runUptimeMiningDutchOnce() {
         statusToOnline += Array.isArray(r1) ? r1.length : r1?.count || 0;
       }
 
-      if (statusOfflineIds.length) {
+      if (offlineIdsConfirmed.length) {
         const r2 = await sql/*sql*/`
           UPDATE miners
           SET status = 'offline'
-          WHERE id = ANY(${statusOfflineIds})
+          WHERE id = ANY(${offlineIdsConfirmed})
             AND status IS DISTINCT FROM 'offline'
             AND lower(COALESCE(status, '')) <> 'maintenance'
           RETURNING id
@@ -559,9 +653,9 @@ export async function runUptimeMiningDutchOnce() {
           account_id,
           coin,
           workers: list.length,
-          billingOnline: billingOnlineIds.length,
-          statusOnline: statusOnlineIds.length,
-          statusOffline: statusOfflineIds.length,
+          onlineConfirmed: onlineIdsConfirmed.length,
+          offlineConfirmed: offlineIdsConfirmed.length,
+          fallbackOnline: fallbackOnlineIds.length,
         });
       }
     }
