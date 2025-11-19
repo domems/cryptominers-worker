@@ -11,8 +11,10 @@ const TAG = "[uptime:miningdutch]";
 const DEBUG =
   (process.env.DEBUG_UPTIME_MININGDUTCH ?? "false").toLowerCase() === "true";
 
-// janela de tolerância para assumir que continua online
-const GRACE_MINUTES = 30;
+// tolerância para considerar que continua online (erros / sem info)
+const GRACE_MINUTES = 60;
+// quantos slots de 15 min seguidos offline até assumir OFFLINE
+const OFFLINE_TOLERANCE_SLOTS = 4;
 
 // usa fetch global se existir, senão node-fetch
 const fetch = globalThis.fetch || fetchOrig;
@@ -108,6 +110,13 @@ function isOnlineFromWorker(w) {
 
   return false;
 }
+
+/* =============================== */
+/* redis keys helpers              */
+/* =============================== */
+const redisKeyLastOnline = (id) => `uptime:lastOnline:miningdutch:${id}`;
+const redisKeyOfflineStreak = (id) =>
+  `uptime:offlineStreak:miningdutch:${id}`;
 
 /* =============================== */
 /* parser robusto                  */
@@ -245,60 +254,21 @@ async function fetchMiningDutchWorkers({ coin, account_id, api_key }) {
 }
 
 /* =============================== */
-/* auxiliar: classificar offline   */
-/* com GRACE (histórico)          */
+/* GRACE em caso de erro / noInfo */
 /* =============================== */
-async function classifyOfflineWithGrace(
-  m,
-  slot,
-  fallbackOnlineIds,
-  offlineIdsConfirmed
-) {
-  const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
-  const statusLower = low(m.status);
-  let treatedOnline = false;
-
-  try {
-    const last = await redis.get(redisKey);
-    if (
-      (last && minutesDiff(last, slot) <= GRACE_MINUTES) ||
-      statusLower === "online"
-    ) {
-      treatedOnline = true;
-    }
-  } catch (e) {
-    console.warn(TAG, "redis.get lastOnline failed", {
-      id: m.id,
-      error: e?.message || String(e),
-    });
-  }
-
-  if (treatedOnline) {
-    // considera online neste slot (horas), mas NÃO mexe estado aqui
-    fallbackOnlineIds.push(m.id);
-  } else {
-    // só é usado quando a API devolveu explicitamente este worker como offline
-    offlineIdsConfirmed.push(m.id);
-  }
-}
-
 /**
- * Versão para ERRO de API / worker não devolvido:
- * - Se esteve online recentemente (GRACE) → conta horas (fallbackOnlineIds)
- * - Nunca adiciona a offlineIdsConfirmed (não muda status para offline).
+ * Para ERRO de API / worker não devolvido:
+ * - Se esteve online nos últimos GRACE_MINUTES → conta horas (fallbackOnlineIds)
+ * - Não mexe em status.
  */
 async function classifyErrorWithGrace(m, slot, fallbackOnlineIds) {
-  const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
-  const statusLower = low(m.status);
-  let treatedOnline = false;
+  const key = redisKeyLastOnline(m.id);
 
   try {
-    const last = await redis.get(redisKey);
-    if (
-      (last && minutesDiff(last, slot) <= GRACE_MINUTES) ||
-      statusLower === "online"
-    ) {
-      treatedOnline = true;
+    const last = await redis.get(key);
+    if (last && minutesDiff(last, slot) <= GRACE_MINUTES) {
+      // conta horas como online neste slot
+      fallbackOnlineIds.push(m.id);
     }
   } catch (e) {
     console.warn(TAG, "redis.get lastOnline (error) failed", {
@@ -306,9 +276,99 @@ async function classifyErrorWithGrace(m, slot, fallbackOnlineIds) {
       error: e?.message || String(e),
     });
   }
+}
 
-  if (treatedOnline) {
+/* =============================== */
+/* offline streak para "online"   */
+/* =============================== */
+/**
+ * Worker estava ONLINE na BD e a API confirmou OFFLINE (após 2ª chamada).
+ * Só marcamos offline depois de OFFLINE_TOLERANCE_SLOTS slots seguidos.
+ * Até lá: conta horas (fallbackOnlineIds) e mantém status.
+ */
+async function handleConfirmedApiOfflineForOnlineMiner(
+  m,
+  slot,
+  fallbackOnlineIds,
+  offlineIdsConfirmed
+) {
+  const streakKey = redisKeyOfflineStreak(m.id);
+  let streak = 1;
+
+  try {
+    const val = await redis.incr(streakKey);
+    streak = Number.isFinite(Number(val)) ? Number(val) : 1;
+  } catch (e) {
+    console.warn(TAG, "redis.incr offlineStreak failed", {
+      id: m.id,
+      error: e?.message || String(e),
+    });
+    streak = 1;
+  }
+
+  if (streak < OFFLINE_TOLERANCE_SLOTS) {
+    // ainda em tolerância → tratamos como online para faturação
     fallbackOnlineIds.push(m.id);
+    if (DEBUG) {
+      console.log(TAG, "OFFLINE_TOLERANCE", {
+        id: m.id,
+        slot,
+        streak,
+        needed: OFFLINE_TOLERANCE_SLOTS,
+      });
+    }
+    return;
+  }
+
+  // atingiu o limite → agora confirmamos OFFLINE
+  offlineIdsConfirmed.push(m.id);
+
+  try {
+    await redis.del(redisKeyLastOnline(m.id));
+    await redis.del(streakKey);
+  } catch (e) {
+    console.warn(TAG, "redis.del streak/lastOnline (confirmed offline) failed", {
+      id: m.id,
+      error: e?.message || String(e),
+    });
+  }
+
+  if (DEBUG) {
+    console.log(TAG, "OFFLINE_CONFIRMED", {
+      id: m.id,
+      slot,
+      streak,
+    });
+  }
+}
+
+/**
+ * Quando API confirma ONLINE:
+ * - adiciona a onlineIdsConfirmed
+ * - grava lastOnline
+ * - limpa offlineStreak
+ */
+async function markOnlineAndResetStreak(m, slot, onlineIdsConfirmed) {
+  onlineIdsConfirmed.push(m.id);
+
+  try {
+    await redis.set(redisKeyLastOnline(m.id), slot, {
+      ex: 7 * 24 * 60 * 60,
+    });
+  } catch (e) {
+    console.warn(TAG, "redis.set lastOnline failed", {
+      id: m.id,
+      error: e?.message || String(e),
+    });
+  }
+
+  try {
+    await redis.del(redisKeyOfflineStreak(m.id));
+  } catch (e) {
+    console.warn(TAG, "redis.del offlineStreak failed", {
+      id: m.id,
+      error: e?.message || String(e),
+    });
   }
 }
 
@@ -403,9 +463,9 @@ export async function runUptimeMiningDutchOnce() {
         });
       }
 
-      const onlineIdsConfirmed = [];   // API confirmou online
-      const offlineIdsConfirmed = [];  // API confirmou offline
-      const fallbackOnlineIds = [];    // online por GRACE (erro/ transição)
+      const onlineIdsConfirmed = [];   // API confirmou online neste slot
+      const offlineIdsConfirmed = [];  // API confirmou offline (após tolerância)
+      const fallbackOnlineIds = [];    // online por GRACE / tolerância
 
       /* ---------- 1) Fetch com retry de grupo ---------- */
       let workers = null;
@@ -449,7 +509,7 @@ export async function runUptimeMiningDutchOnce() {
         }
 
         if (groupFullyFailed || !workers) {
-          // API deste grupo está mesmo fodida neste slot:
+          // API deste grupo está mesmo em erro neste slot:
           // → NUNCA marcamos offline
           // → Só somamos horas se GRACE disser que esteve online há pouco
           for (const m of list) {
@@ -464,35 +524,26 @@ export async function runUptimeMiningDutchOnce() {
           }
 
           const suspicious = [];        // API offline mas BD dizia online
-          const offlineCandidates = []; // API offline (com info) para BD ≠ online
-          const noInfo = [];            // worker não apareceu na resposta → tratar como "erro"
+          const offlineCandidates = []; // API offline com BD ≠ online
+          const noInfo = [];            // worker não apareceu na resposta → tratar como erro/inconclusivo
 
           for (const m of list) {
             const t = low(tail(m.worker_name));
             const info = t ? byTail.get(t) : null;
-            const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
 
             if (info) {
               const apiOnline = isOnlineFromWorker(info);
 
               if (apiOnline) {
-                // API garantiu online → aceitamos
-                onlineIdsConfirmed.push(m.id);
-                try {
-                  await redis.set(redisKey, sISO, { ex: 7 * 24 * 60 * 60 });
-                } catch (e) {
-                  console.warn(TAG, "redis.set lastOnline failed", {
-                    id: m.id,
-                    error: e?.message || String(e),
-                  });
-                }
+                // API garantiu online → aceitamos e reset streak
+                await markOnlineAndResetStreak(m, sISO, onlineIdsConfirmed);
               } else {
                 const statusLower = low(m.status);
                 if (statusLower === "online") {
                   // EXACTAMENTE o caso: API diz offline mas BD está online
                   suspicious.push(m);
                 } else {
-                  // API disse offline e BD já não está online → candidato normal a offline
+                  // API disse offline e BD já não está online → mantém offline
                   offlineCandidates.push(m);
                 }
               }
@@ -536,8 +587,6 @@ export async function runUptimeMiningDutchOnce() {
             }
 
             for (const m of suspicious) {
-              const redisKey = `uptime:lastOnline:miningdutch:${m.id}`;
-
               if (byTailRetry) {
                 const t = low(tail(m.worker_name));
                 const info2 = t ? byTailRetry.get(t) : null;
@@ -545,51 +594,28 @@ export async function runUptimeMiningDutchOnce() {
 
                 if (apiOnline2) {
                   // 2ª chamada corrigiu → tratamos como online (confirmado)
-                  onlineIdsConfirmed.push(m.id);
-                  try {
-                    await redis.set(redisKey, sISO, { ex: 7 * 24 * 60 * 60 });
-                  } catch (e) {
-                    console.warn(TAG, "redis.set lastOnline (retry) failed", {
-                      id: m.id,
-                      error: e?.message || String(e),
-                    });
-                  }
+                  await markOnlineAndResetStreak(m, sISO, onlineIdsConfirmed);
                   continue; // próximo suspeito
                 }
               }
 
               // === 2ª chamada continuou a dar offline ===
-              // ESTE slot ainda conta horas como online (último 15 min)
-              fallbackOnlineIds.push(m.id);
-
-              // Estado passa OFFLINE daqui para a frente (API insistiu offline)
-              offlineIdsConfirmed.push(m.id);
-
-              // Limpar histórico para não ficar "online para sempre" por GRACE
-              try {
-                await redis.del(redisKey);
-              } catch (e) {
-                console.warn(
-                  TAG,
-                  "redis.del lastOnline (confirmed offline) failed",
-                  {
-                    id: m.id,
-                    error: e?.message || String(e),
-                  }
-                );
-              }
+              // Worker estava ONLINE na BD e API insistiu offline:
+              // aplica regra de 4 slots de tolerância
+              await handleConfirmedApiOfflineForOnlineMiner(
+                m,
+                sISO,
+                fallbackOnlineIds,
+                offlineIdsConfirmed
+              );
             }
           }
 
-          /* ---------- 4) GRACE para os offline restantes ---------- */
+          /* ---------- 4) restantes offlineCandidates ---------- */
+          // Aqui entram workers que já não estavam "online" na BD.
+          // Mantemos offline; não damos horas extra.
           for (const m of offlineCandidates) {
-            // Aqui só entra quem a API retornou explicitamente offline
-            await classifyOfflineWithGrace(
-              m,
-              sISO,
-              fallbackOnlineIds,
-              offlineIdsConfirmed
-            );
+            offlineIdsConfirmed.push(m.id);
           }
 
           /* ---------- 5) "Erro"/sem info: só GRACE para horas ---------- */
@@ -607,7 +633,7 @@ export async function runUptimeMiningDutchOnce() {
         );
       }
 
-      /* ---------- 5) Aplicar horas + estados para este grupo ---------- */
+      /* ---------- 6) Aplicar horas + estados para este grupo ---------- */
       // Horas online (confirmed + fallback, dedupe por slot)
       const onlineIdsForHours = dedupeForHours([
         ...onlineIdsConfirmed,
